@@ -1,7 +1,7 @@
 from pathlib import Path
 from dataloader import MahjongToyDataset, build_toy_dataset
 import kagglehub
-from model import SmallMahjongResNet
+from .model import SmallMahjongResNet
 import torch
 import random
 from torch.utils.data import DataLoader
