@@ -72,7 +72,7 @@ class Bot:
             return None
 
         idx = self._predict_discard_idx()
-        pai = self.round_state.choose_discard_tile(idx)
+        pai = self.round_state.choose_discard_tile(self.player_id, idx)
 
         return {
             "type": "dahai",
@@ -95,7 +95,7 @@ class Bot:
 
             if t == "start_game":
                 self.player_id = e["id"]
-                self.round_state = ToyRoundState(self.player_id)
+                self.round_state = ToyRoundState()
                 self._load_model()
                 return_action = {"type": "none"}
                 continue

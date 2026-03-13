@@ -1,28 +1,34 @@
 from pathlib import Path
-from collections import defaultdict
 import torch
 import gzip
 import random
 import json
 from torch.utils.data import Dataset
-from .gamestate import ToyRoundState, pai_to_idx
+
+from gamestate import ToyRoundState, pai_to_idx
+
 
 def open_mjson(path):
     with open(path, "rb") as f:
         magic = f.read(2)
 
-    if magic == b"\x1f\x8b":  # gzip magic number
+    if magic == b"\x1f\x8b":
         return gzip.open(path, "rt", encoding="utf-8")
     else:
         return open(path, "r", encoding="utf-8")
 
+
 # ============================================================
 # Parse a single mjai log and extract toy samples
 # ============================================================
+
 def extract_samples_from_gz(path: Path, max_samples_remaining: int):
     samples = []
     state = ToyRoundState()
-    last_tsumo_actor = None
+
+    # pending sample after a tsumo:
+    # (actor, feature, mask)
+    pending = None
 
     with open_mjson(path) as f:
         for line in f:
@@ -34,63 +40,52 @@ def extract_samples_from_gz(path: Path, max_samples_remaining: int):
             etype = event.get("type")
 
             if etype == "start_kyoku":
-                state.reset_round(event)
-                last_tsumo_actor = None
+                pending = None
+                state.apply_event(event)
+                continue
 
-            elif etype == "dora":
-                marker = event.get("dora_marker")
-                idx = tile_to_idx(marker)
-                if idx is not None:
-                    state.dora_indicators.append(idx)
+            # If calls / win / draw interrupt the tsumo->dahai chain, drop pending
+            if etype in {"chi", "pon", "daiminkan", "ankan", "kakan", "hora", "ryukyoku", "end_kyoku"}:
+                pending = None
+                state.apply_event(event)
+                continue
 
-            elif etype == "reach_accepted":
+            if etype == "tsumo":
                 actor = event.get("actor")
+
+                # update state first so hand includes drawn tile
+                state.apply_event(event)
+
                 if actor is not None:
-                    state.riichi[actor] = 1
-
-            elif etype == "tsumo":
-                actor = event.get("actor")
-                pai = event.get("pai")
-                if actor is not None and pai is not None:
-                    state.add_tile_to_hand(actor, pai)
-                    last_tsumo_actor = actor
+                    feat = state.to_feature(actor)
+                    mask = feat[0] > 0  # plane 0 = hand counts
+                    pending = (actor, feat, mask)
                 else:
-                    last_tsumo_actor = None
+                    pending = None
 
-            elif etype == "dahai":
+                continue
+
+            if etype == "dahai":
                 actor = event.get("actor")
                 pai = event.get("pai")
-                tsumogiri = bool(event.get("tsumogiri", False))
-                label = pai_to_idx(pai)
 
-                if actor is not None and pai is not None:
-                    # Create training sample only if this discard follows own tsumo
-                    # This keeps the task simpler.
-                    if actor == last_tsumo_actor and label is not None:
-                        feat = state.to_feature(actor)
-                        hand_counts = feat[0]
-                        # create a mask that would be valid for discard
-                        mask = hand_counts > 0
+                if pending is not None:
+                    pending_actor, feat, mask = pending
+
+                    if actor == pending_actor and pai is not None:
+                        label = pai_to_idx(pai)
                         samples.append((feat, mask, label))
 
                         if len(samples) >= max_samples_remaining:
                             break
 
-                    state.remove_tile_from_hand(actor, pai)
-                    state.add_discard(actor, pai)
+                # now update state with the discard
+                state.apply_event(event)
+                pending = None
+                continue
 
-                last_tsumo_actor = None
-
-            elif etype in {"pon", "chi", "daiminkan", "ankan", "kakan"}:
-                # For this toy script, we are NOT updating meld state properly.
-                # We only invalidate the "tsumo -> discard" chain.
-                last_tsumo_actor = None
-
-            else:
-                # ignore everything else for the toy baseline
-                pass
-
-    
+            # all other events: just apply if supported
+            state.apply_event(event)
 
     return samples
 
@@ -98,12 +93,14 @@ def extract_samples_from_gz(path: Path, max_samples_remaining: int):
 # ============================================================
 # Collect a tiny dataset
 # ============================================================
+
 def find_gz_files(root_dir: Path, years, max_files):
     files = []
     for year in years:
-        year_dir = root_dir / year
+        year_dir = root_dir / str(year)
         if not year_dir.exists():
             continue
+
         year_files = list(year_dir.rglob("*.mjson"))
         random.shuffle(year_files)
         files.extend(year_files)
@@ -134,6 +131,7 @@ def build_toy_dataset(root_dir: Path, years, max_files, max_samples):
 # ============================================================
 # PyTorch dataset
 # ============================================================
+
 class MahjongToyDataset(Dataset):
     def __init__(self, samples):
         self.x = [s[0] for s in samples]

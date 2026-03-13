@@ -32,6 +32,9 @@ def pai_to_idx(pai: str) -> int:
     """
     if pai in HONOR_TO_IDX:
         return HONOR_TO_IDX[pai]
+    
+    if len(pai) == 3 and pai[2] == "r":
+        pai = pai[:2]
 
     if len(pai) != 2:
         raise ValueError(f"Invalid pai: {pai}")
@@ -87,8 +90,7 @@ class ToyRoundState:
     - plane 9: round summary broadcast
     """
 
-    def __init__(self, player_id: int):
-        self.player_id = player_id
+    def __init__(self):
         self.reset()
 
     def reset(self):
@@ -102,7 +104,7 @@ class ToyRoundState:
         self.kyotaku = 0
         self.oya = 0
         self.scores = [25000] * 4
-        self.last_self_draw: Optional[str] = None
+        self.last_draw: List[Optional[str]] = [None] * 4
 
     def start_kyoku(self, event: dict):
         self.discards = [[0] * 34 for _ in range(4)]
@@ -114,12 +116,11 @@ class ToyRoundState:
         self.kyotaku = event["kyotaku"]
         self.oya = event["oya"]
         self.scores = event["scores"][:]
-        self.last_self_draw = None
+        self.last_draw: List[Optional[str]] = [None] * 4
 
         self.hands = [[] for _ in range(4)]
-        tehais = event["tehais"]
-        my_tehais = tehais[self.player_id]
-        self.hands[self.player_id] = [p for p in my_tehais if p != "?"]
+        for pid in range(4):
+            self.hands[pid] = [p for p in event["tehais"][pid] if p != "?"]
 
     def hand_counts(self, actor: int) -> List[int]:
         counts = [0] * 34
@@ -131,9 +132,9 @@ class ToyRoundState:
         actor = event["actor"]
         pai = event["pai"]
 
-        if actor == self.player_id and pai != "?":
+        if pai != "?":
             self.hands[actor].append(pai)
-            self.last_self_draw = pai
+            self.last_draw[actor] = pai
 
     def on_dahai(self, event: dict):
         actor = event["actor"]
@@ -142,10 +143,12 @@ class ToyRoundState:
 
         self.discards[actor][pai_to_idx(pai)] += 1
 
-        if actor == self.player_id:
+        # If we know this player's hand, remove the discarded tile from it.
+        if self.hands[actor]:
             self._remove_one_tile(self.hands[actor], pai)
-            if tsumogiri or self.last_self_draw == pai:
-                self.last_self_draw = None
+
+        if tsumogiri or self.last_draw[actor] == pai:
+            self.last_draw[actor] = None
 
     def on_reach(self, event: dict):
         actor = event["actor"]
@@ -225,17 +228,17 @@ class ToyRoundState:
 
         return x
 
-    def choose_discard_tile(self, idx: int) -> str:
+    def choose_discard_tile(self, actor: int, idx: int) -> str:
         """
         Convert predicted 34-index into a concrete tile string from hand.
 
         Prefer tsumogiri if the drawn tile matches the chosen index.
         Otherwise discard any matching tile in hand.
         """
-        if self.last_self_draw is not None and pai_to_idx(self.last_self_draw) == idx:
-            return self.last_self_draw
+        if self.last_draw[actor] is not None and pai_to_idx(self.last_draw[actor]) == idx:
+            return self.last_draw[actor]
 
-        for pai in self.hands[self.player_id]:
+        for pai in self.hands[actor]:
             if pai_to_idx(pai) == idx:
                 return pai
 
