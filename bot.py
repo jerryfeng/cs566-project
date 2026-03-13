@@ -5,13 +5,15 @@ from typing import Optional
 import torch
 from .model import SmallMahjongResNet
 from .gamestate import ToyRoundState
+from .logger import logger
+import pathlib
 
 # ============================================================
 # Bot
 # ============================================================
 
 class Bot:
-    def __init__(self, model_path: str = "checkpoints/best.pt", device: Optional[str] = None):
+    def __init__(self, model_path: str = "./toy_mahjong_resnet.pt", device: Optional[str] = None):
         self.player_id: Optional[int] = None
         self.model_path = model_path
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,8 +25,9 @@ class Bot:
             return
 
         model = SmallMahjongResNet()
+        path = pathlib.Path(__file__).parent / self.model_path
 
-        ckpt = torch.load(self.model_path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device)
 
         # common checkpoint patterns
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
@@ -127,7 +130,7 @@ def main():
     - read one line of JSON events from stdin
     - print one JSON action to stdout
     """
-    model_path = sys.argv[1] if len(sys.argv) >= 2 else "toy_mahjong_resnet.pt"
+    model_path = sys.argv[1] if len(sys.argv) >= 2 else "./toy_mahjong_resnet.pt"
     bot = Bot(model_path=model_path)
 
     for line in sys.stdin:
@@ -138,10 +141,10 @@ def main():
         try:
             res = bot.react(line)
         except Exception as e:
-            print(f"Bot crashed while reacting to: {line}")
+            logger.error(f"Bot crashed while reacting to: {line}")
             res = json.dumps({"type": "none"}, separators=(",", ":"))
 
-        print(res, flush=True)
+        logger.info(res, flush=True)
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ def pai_to_idx(pai: str) -> int:
         raise ValueError(f"Invalid pai: {pai}")
 
     num, suit = pai[0], pai[1]
-    if num == "0":  # aka red five
+    if num == "0":
         num = "5"
 
     n = int(num)
@@ -65,22 +65,26 @@ def idx_to_pai(idx: int) -> str:
         return IDX_TO_HONOR[idx]
     raise ValueError(f"Invalid idx: {idx}")
 
+
 # ============================================================
 # Tiny game state tracker
 # ============================================================
+
 class ToyRoundState:
     """
     Minimal state for a discard-only bot.
 
-    This is intentionally simple:
-    - tracks your own hand exactly
-    - tracks public discards
-    - tracks riichi flags
-    - tracks dora indicator / round info
-    - only produces discard decisions on your own tsumo
-
-    If your training features use a richer state, replace `to_feature()`
-    with your exact feature builder.
+    10-channel feature layout:
+    - plane 0: current player's hand counts
+    - plane 1: current player's discards
+    - plane 2: next opponent discards
+    - plane 3: opposite opponent discards
+    - plane 4: previous opponent discards
+    - plane 5: dora indicators
+    - plane 6: next opponent riichi broadcast
+    - plane 7: opposite opponent riichi broadcast
+    - plane 8: previous opponent riichi broadcast
+    - plane 9: round summary broadcast
     """
 
     def __init__(self, player_id: int):
@@ -140,9 +144,7 @@ class ToyRoundState:
 
         if actor == self.player_id:
             self._remove_one_tile(self.hands[actor], pai)
-            if tsumogiri:
-                self.last_self_draw = None
-            elif self.last_self_draw == pai:
+            if tsumogiri or self.last_self_draw == pai:
                 self.last_self_draw = None
 
     def on_reach(self, event: dict):
@@ -171,51 +173,54 @@ class ToyRoundState:
             "chi", "pon", "daiminkan", "ankan", "kakan",
             "hora", "ryukyoku", "end_kyoku"
         }:
-            # For a discard-only toy bot, we ignore deep hand-structure updates here.
-            # If you later train call decisions, extend this section.
             pass
 
     def to_feature(self, actor: int) -> torch.Tensor:
         """
         Returns tensor shape [10, 34].
-
-        This matches the kind of toy feature layout you described earlier.
-        Replace this with your EXACT training feature builder if needed.
         """
         x = torch.zeros(10, 34, dtype=torch.float32)
 
+        # relative opponent order:
+        # plane 2/6 = shimocha  (actor+1)%4
+        # plane 3/7 = toimen    (actor+2)%4
+        # plane 4/8 = kamicha   (actor+3)%4
+        opponents = [
+            (actor + 1) % 4,
+            (actor + 2) % 4,
+            (actor + 3) % 4,
+        ]
+
         # plane 0: current player's hand counts
-        for idx, cnt in self.hands[actor].items():
-            x[0, idx] = cnt
+        hand_cnts = self.hand_counts(actor)
+        for idx, cnt in enumerate(hand_cnts):
+            x[0, idx] = float(cnt)
 
         # plane 1: current player's discards
-        for idx, cnt in self.discards[actor].items():
-            x[1, idx] = cnt
+        for idx, cnt in enumerate(self.discards[actor]):
+            x[1, idx] = float(cnt)
 
-        # plane 2-4: opponents' discards combined
-        i = 0
-        for other in range(4):
-            if other == actor:
-                continue
-            for idx, cnt in self.discards[other].items():
-                x[2 + i, idx] += cnt
-            i += 1
+        # planes 2-4: opponents' discards in relative seat order
+        for plane_offset, other in enumerate(opponents):
+            for idx, cnt in enumerate(self.discards[other]):
+                x[2 + plane_offset, idx] = float(cnt)
 
         # plane 5: dora indicators
         for idx in self.dora_indicators:
             x[5, idx] = 1.0
 
-        # plane 6-8: riichi flags broadcast
-        i = 0
-        for other in range(4):
-            if other == actor:
-                continue
-            x[6 + i, :] = float(self.riichi[other])
-            i += 1
+        # planes 6-8: riichi flags broadcast for each opponent
+        for plane_offset, other in enumerate(opponents):
+            x[6 + plane_offset, :] = float(self.riichi[other])
 
         # plane 9: simple round summary broadcast
         bakaze_val = {"E": 0.0, "S": 1.0, "W": 2.0, "N": 3.0}.get(self.bakaze, 0.0)
-        summary = bakaze_val * 0.1 + self.kyoku * 0.1 + self.honba * 0.01 + self.kyotaku * 0.01
+        summary = (
+            bakaze_val * 0.1
+            + float(self.kyoku) * 0.1
+            + float(self.honba) * 0.01
+            + float(self.kyotaku) * 0.01
+        )
         x[9, :] = summary
 
         return x
@@ -234,7 +239,7 @@ class ToyRoundState:
             if pai_to_idx(pai) == idx:
                 return pai
 
-        # Should not happen if mask is correct, but keep a safe fallback.
+        # Safe fallback if mask/model/state get out of sync
         return idx_to_pai(idx)
 
     @staticmethod
