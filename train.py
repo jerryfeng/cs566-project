@@ -6,6 +6,7 @@ from dataloader import (
 import kagglehub
 from model import SmallMahjongResNet
 import torch
+import torch.nn.functional as F
 import random
 from torch.utils.data import DataLoader
 from collections import Counter
@@ -22,11 +23,12 @@ YEARS = [str(y) for y in range(2023, 2025)]
 MAX_FILES = 5000
 MAX_DISCARD_SAMPLES = 1_000_000
 MAX_CALL_SAMPLES = 500_000
-BATCH_SIZE = 512
-EPOCHS = 30
-LR = 1e-3
-LABEL_SMOOTHING = 0.1
-CALL_LOSS_WEIGHT = 0.5       # weight of call loss relative to discard loss
+BATCH_SIZE = 256
+EPOCHS = 50
+LR = 3e-4                        # lower base LR (was 1e-3)
+WARMUP_EPOCHS = 5                 # warmup before cosine decay
+LABEL_SMOOTHING = 0.05            # reduced (was 0.1)
+CALL_LOSS_WEIGHT = 0.5
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
 
@@ -42,14 +44,32 @@ if torch.cuda.is_available():
 
 
 # ============================================================
-# Compute class weights for call samples (handle imbalance)
+# Masked prediction (mask only at inference, NOT in loss)
+# ============================================================
+
+def masked_prediction(logits, mask):
+    """Apply mask only for argmax prediction, not for loss computation."""
+    masked = logits.clone()
+    masked[~mask] = -1e9
+    return masked
+
+
+# ============================================================
+# LR scheduler with linear warmup + cosine decay
+# ============================================================
+
+def get_lr(epoch, warmup_epochs, max_epochs, base_lr):
+    if epoch <= warmup_epochs:
+        return base_lr * epoch / max(warmup_epochs, 1)
+    progress = (epoch - warmup_epochs) / max(max_epochs - warmup_epochs, 1)
+    return base_lr * 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159)).item())
+
+
+# ============================================================
+# Class weights for call (sqrt-dampened to avoid instability)
 # ============================================================
 
 def compute_call_weights(samples):
-    """
-    Call samples are heavily imbalanced (mostly pass).
-    Compute inverse-frequency weights for CrossEntropyLoss.
-    """
     labels = [s[1] for s in samples]
     counts = Counter(labels)
     total = len(labels)
@@ -58,10 +78,11 @@ def compute_call_weights(samples):
     weights = torch.ones(num_classes)
     for cls in range(num_classes):
         if counts[cls] > 0:
-            weights[cls] = total / (num_classes * counts[cls])
+            raw = total / (num_classes * counts[cls])
+            weights[cls] = raw ** 0.5  # sqrt dampening
 
     print(f"Call label distribution: {dict(counts)}")
-    print(f"Call class weights: {weights.tolist()}")
+    print(f"Call class weights (sqrt-dampened): {[f'{w:.3f}' for w in weights.tolist()]}")
     return weights
 
 
@@ -69,7 +90,7 @@ def compute_call_weights(samples):
 # Evaluate
 # ============================================================
 
-def evaluate_discard(model, loader, criterion):
+def evaluate_discard(model, loader):
     model.eval()
     total_loss = 0.0
     total = 0
@@ -80,16 +101,16 @@ def evaluate_discard(model, loader, criterion):
         for x, mask, y in loader:
             x, mask, y = x.to(DEVICE), mask.to(DEVICE), y.to(DEVICE)
             logits = model.forward_discard(x)
-            masked = logits.masked_fill(~mask, -1e9)
-            loss = criterion(masked, y)
 
+            loss = F.cross_entropy(logits, y, label_smoothing=LABEL_SMOOTHING)
             total_loss += loss.item() * x.size(0)
             total += x.size(0)
 
-            pred = masked.argmax(dim=1)
+            pred_logits = masked_prediction(logits, mask)
+            pred = pred_logits.argmax(dim=1)
             correct_top1 += (pred == y).sum().item()
 
-            _, top3 = masked.topk(3, dim=1)
+            _, top3 = pred_logits.topk(3, dim=1)
             correct_top3 += (top3 == y.unsqueeze(1)).any(dim=1).sum().item()
 
     n = max(total, 1)
@@ -102,7 +123,6 @@ def evaluate_call(model, loader, criterion):
     total = 0
     correct = 0
 
-    # per-class accuracy
     class_correct = [0, 0, 0]
     class_total = [0, 0, 0]
 
@@ -124,13 +144,10 @@ def evaluate_call(model, loader, criterion):
                 class_correct[cls] += (pred[cls_mask] == cls).sum().item()
 
     n = max(total, 1)
-    class_acc = {}
     label_names = {0: "pass", 1: "pon", 2: "chi"}
+    class_acc = {}
     for cls in range(3):
-        if class_total[cls] > 0:
-            class_acc[label_names[cls]] = class_correct[cls] / class_total[cls]
-        else:
-            class_acc[label_names[cls]] = 0.0
+        class_acc[label_names[cls]] = class_correct[cls] / max(class_total[cls], 1)
 
     return total_loss / n, correct / n, class_acc
 
@@ -147,7 +164,7 @@ def train():
     )
 
     if len(discard_samples) < 100:
-        print("Too few discard samples. Increase MAX_FILES or MAX_DISCARD_SAMPLES.")
+        print("Too few discard samples.")
         return
 
     # split discard
@@ -186,14 +203,12 @@ def train():
     if has_call:
         print(f"Call train/val:     {len(c_train):,} / {len(c_val):,}")
 
-    discard_criterion = torch.nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
     call_criterion = (
         torch.nn.CrossEntropyLoss(weight=call_weights, label_smoothing=LABEL_SMOOTHING)
         if has_call else None
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     # --- resume ---
     start_epoch = 1
@@ -204,58 +219,73 @@ def train():
         ckpt = torch.load(RESUME_PATH, map_location=DEVICE)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         best_val_acc = ckpt.get("best_val_acc", 0.0)
         print(f"  Resumed at epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
 
     print(f"Device: {DEVICE}")
+    print(f"LR: {LR}, Warmup: {WARMUP_EPOCHS} epochs, Total: {EPOCHS} epochs")
     print()
 
     # --- training loop ---
     for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
 
+        # update learning rate
+        current_lr = get_lr(epoch, WARMUP_EPOCHS, EPOCHS, LR)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+
         # ---- discard training ----
         d_loss_sum, d_total, d_correct = 0.0, 0, 0
         for x, mask, y in d_train_loader:
             x, mask, y = x.to(DEVICE), mask.to(DEVICE), y.to(DEVICE)
+
             optimizer.zero_grad()
             logits = model.forward_discard(x)
-            masked = logits.masked_fill(~mask, -1e9)
-            loss = discard_criterion(masked, y)
+
+            # KEY FIX: compute loss on raw logits, NOT masked logits
+            # the target tile is always in hand, so raw CE works fine
+            # masking with -1e9 was causing the loss to explode to 68 million
+            loss = F.cross_entropy(logits, y, label_smoothing=LABEL_SMOOTHING)
             loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             d_loss_sum += loss.item() * x.size(0)
-            d_correct += (masked.argmax(dim=1) == y).sum().item()
             d_total += x.size(0)
+
+            # accuracy still uses mask (only count valid predictions)
+            with torch.no_grad():
+                pred = masked_prediction(logits, mask).argmax(dim=1)
+                d_correct += (pred == y).sum().item()
 
         # ---- call training ----
         c_loss_sum, c_total, c_correct = 0.0, 0, 0
         if has_call:
             for x, y in c_train_loader:
                 x, y = x.to(DEVICE), y.to(DEVICE)
+
                 optimizer.zero_grad()
                 logits = model.forward_call(x)
                 loss = call_criterion(logits, y) * CALL_LOSS_WEIGHT
                 loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
                 c_loss_sum += loss.item() * x.size(0)
                 c_correct += (logits.argmax(dim=1) == y).sum().item()
                 c_total += x.size(0)
 
-        scheduler.step()
-
         # ---- evaluate ----
-        d_val_loss, d_val_top1, d_val_top3 = evaluate_discard(model, d_val_loader, discard_criterion)
-        lr_now = scheduler.get_last_lr()[0]
+        d_val_loss, d_val_top1, d_val_top3 = evaluate_discard(model, d_val_loader)
 
         print(
-            f"Epoch {epoch:02d}/{EPOCHS} | lr={lr_now:.6f} | "
+            f"Epoch {epoch:02d}/{EPOCHS} | lr={current_lr:.6f} | "
             f"discard: loss={d_loss_sum/d_total:.4f} acc={d_correct/d_total:.4f} "
-            f"val_top1={d_val_top1:.4f} val_top3={d_val_top3:.4f}"
+            f"val_loss={d_val_loss:.4f} val_top1={d_val_top1:.4f} val_top3={d_val_top3:.4f}"
         )
 
         if has_call and c_total > 0:
@@ -266,7 +296,7 @@ def train():
                 f"[pass={c_class_acc['pass']:.3f} pon={c_class_acc['pon']:.3f} chi={c_class_acc['chi']:.3f}]"
             )
 
-        # save best (based on discard val accuracy)
+        # save best model
         if d_val_top1 > best_val_acc:
             best_val_acc = d_val_top1
             torch.save(model.state_dict(), BEST_MODEL_PATH)
@@ -277,7 +307,6 @@ def train():
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
             "best_val_acc": best_val_acc,
         }, CHECKPOINT_DIR / "latest.pt")
 
