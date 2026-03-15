@@ -1,123 +1,288 @@
 from pathlib import Path
-from dataloader import MahjongToyDataset, build_toy_dataset
+from dataloader import (
+    MahjongDiscardDataset, MahjongCallDataset,
+    build_dataset,
+)
 import kagglehub
 from model import SmallMahjongResNet
 import torch
 import random
 from torch.utils.data import DataLoader
+from collections import Counter
+
+# ============================================================
+# Config
+# ============================================================
 
 DATASET_HANDLE = "shokanekolouis/tenhou-to-mjai"
 DATASET_PATH = Path(kagglehub.dataset_download(DATASET_HANDLE))
-print("DATASET_PATH: ", DATASET_PATH)
+print("DATASET_PATH:", DATASET_PATH)
 
-YEARS = [str(y) for y in range(2024, 2027)]   # keep tiny for proof of concept
-MAX_FILES = 1000                                # tiny subset
-MAX_SAMPLES = 200000                            # tiny dataset cap
-BATCH_SIZE = 128
-EPOCHS = 15
+YEARS = [str(y) for y in range(2023, 2025)]
+MAX_FILES = 2000
+MAX_DISCARD_SAMPLES = 500_000
+MAX_CALL_SAMPLES = 200_000
+BATCH_SIZE = 256
+EPOCHS = 30
 LR = 1e-3
+LABEL_SMOOTHING = 0.1
+CALL_LOSS_WEIGHT = 0.5       # weight of call loss relative to discard loss
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
 
+CHECKPOINT_DIR = Path("checkpoints")
+CHECKPOINT_DIR.mkdir(exist_ok=True)
+BEST_MODEL_PATH = CHECKPOINT_DIR / "best.pt"
+RESUME_PATH = CHECKPOINT_DIR / "latest.pt"
+
 random.seed(SEED)
 torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
 
 
 # ============================================================
-# Train / eval
+# Compute class weights for call samples (handle imbalance)
 # ============================================================
-def evaluate(model, loader, criterion):
+
+def compute_call_weights(samples):
+    """
+    Call samples are heavily imbalanced (mostly pass).
+    Compute inverse-frequency weights for CrossEntropyLoss.
+    """
+    labels = [s[1] for s in samples]
+    counts = Counter(labels)
+    total = len(labels)
+    num_classes = 3
+
+    weights = torch.ones(num_classes)
+    for cls in range(num_classes):
+        if counts[cls] > 0:
+            weights[cls] = total / (num_classes * counts[cls])
+
+    print(f"Call label distribution: {dict(counts)}")
+    print(f"Call class weights: {weights.tolist()}")
+    return weights
+
+
+# ============================================================
+# Evaluate
+# ============================================================
+
+def evaluate_discard(model, loader, criterion):
+    model.eval()
+    total_loss = 0.0
+    total = 0
+    correct_top1 = 0
+    correct_top3 = 0
+
+    with torch.no_grad():
+        for x, mask, y in loader:
+            x, mask, y = x.to(DEVICE), mask.to(DEVICE), y.to(DEVICE)
+            logits = model.forward_discard(x)
+            masked = logits.masked_fill(~mask, -1e9)
+            loss = criterion(masked, y)
+
+            total_loss += loss.item() * x.size(0)
+            total += x.size(0)
+
+            pred = masked.argmax(dim=1)
+            correct_top1 += (pred == y).sum().item()
+
+            _, top3 = masked.topk(3, dim=1)
+            correct_top3 += (top3 == y.unsqueeze(1)).any(dim=1).sum().item()
+
+    n = max(total, 1)
+    return total_loss / n, correct_top1 / n, correct_top3 / n
+
+
+def evaluate_call(model, loader, criterion):
     model.eval()
     total_loss = 0.0
     total = 0
     correct = 0
 
-    with torch.no_grad():
-        for x, mask, y in loader:
-            x = x.to(DEVICE)
-            mask = mask.to(DEVICE)
-            y = y.to(DEVICE)
+    # per-class accuracy
+    class_correct = [0, 0, 0]
+    class_total = [0, 0, 0]
 
-            logits = model(x)
-            masked_logits = logits.masked_fill(~mask, -1e9)
-            loss = criterion(masked_logits, y)
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            logits = model.forward_call(x)
+            loss = criterion(logits, y)
 
             total_loss += loss.item() * x.size(0)
-            pred = masked_logits.argmax(dim=1)
-            correct += (pred == y).sum().item()
             total += x.size(0)
 
-    return total_loss / max(total, 1), correct / max(total, 1)
+            pred = logits.argmax(dim=1)
+            correct += (pred == y).sum().item()
+
+            for cls in range(3):
+                cls_mask = (y == cls)
+                class_total[cls] += cls_mask.sum().item()
+                class_correct[cls] += (pred[cls_mask] == cls).sum().item()
+
+    n = max(total, 1)
+    class_acc = {}
+    label_names = {0: "pass", 1: "pon", 2: "chi"}
+    for cls in range(3):
+        if class_total[cls] > 0:
+            class_acc[label_names[cls]] = class_correct[cls] / class_total[cls]
+        else:
+            class_acc[label_names[cls]] = 0.0
+
+    return total_loss / n, correct / n, class_acc
+
+
+# ============================================================
+# Train
+# ============================================================
 
 def train():
-    samples = build_toy_dataset(DATASET_PATH, YEARS, MAX_FILES, MAX_SAMPLES)
+    # --- data ---
+    discard_samples, call_samples = build_dataset(
+        DATASET_PATH, YEARS, MAX_FILES,
+        MAX_DISCARD_SAMPLES, MAX_CALL_SAMPLES,
+    )
 
-    if len(samples) < 100:
-        print("Too few samples collected. Increase MAX_FILES or MAX_SAMPLES.")
+    if len(discard_samples) < 100:
+        print("Too few discard samples. Increase MAX_FILES or MAX_DISCARD_SAMPLES.")
         return
 
-    random.shuffle(samples)
-    split = int(0.8 * len(samples))
-    train_samples = samples[:split]
-    val_samples = samples[split:]
+    # split discard
+    random.shuffle(discard_samples)
+    d_split = int(0.85 * len(discard_samples))
+    d_train = MahjongDiscardDataset(discard_samples[:d_split])
+    d_val = MahjongDiscardDataset(discard_samples[d_split:])
 
-    train_ds = MahjongToyDataset(train_samples)
-    val_ds = MahjongToyDataset(val_samples)
+    d_train_loader = DataLoader(d_train, batch_size=BATCH_SIZE, shuffle=True,
+                                num_workers=2, pin_memory=True)
+    d_val_loader = DataLoader(d_val, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=2, pin_memory=True)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+    # split call
+    has_call = len(call_samples) >= 100
+    if has_call:
+        random.shuffle(call_samples)
+        c_split = int(0.85 * len(call_samples))
+        c_train = MahjongCallDataset(call_samples[:c_split])
+        c_val = MahjongCallDataset(call_samples[c_split:])
 
-    model = SmallMahjongResNet().to(DEVICE)
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("Total params:", total)
-    print("Trainable params:", trainable)
-    
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+        c_train_loader = DataLoader(c_train, batch_size=BATCH_SIZE, shuffle=True,
+                                    num_workers=2, pin_memory=True)
+        c_val_loader = DataLoader(c_val, batch_size=BATCH_SIZE, shuffle=False,
+                                  num_workers=2, pin_memory=True)
 
-    print(f"Train samples: {len(train_ds)}")
-    print(f"Val samples:   {len(val_ds)}")
-    print(f"Device:        {DEVICE}")
+        call_weights = compute_call_weights(call_samples[:c_split]).to(DEVICE)
+    else:
+        print("Not enough call samples; training discard only.")
 
-    for epoch in range(1, EPOCHS + 1):
+    # --- model ---
+    model = SmallMahjongResNet(in_channels=16).to(DEVICE)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total params:       {total_params:,}")
+    print(f"Discard train/val:  {len(d_train):,} / {len(d_val):,}")
+    if has_call:
+        print(f"Call train/val:     {len(c_train):,} / {len(c_val):,}")
+
+    discard_criterion = torch.nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    call_criterion = (
+        torch.nn.CrossEntropyLoss(weight=call_weights, label_smoothing=LABEL_SMOOTHING)
+        if has_call else None
+    )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+    # --- resume ---
+    start_epoch = 1
+    best_val_acc = 0.0
+
+    if RESUME_PATH and RESUME_PATH.exists():
+        print(f"Resuming from {RESUME_PATH}")
+        ckpt = torch.load(RESUME_PATH, map_location=DEVICE)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val_acc = ckpt.get("best_val_acc", 0.0)
+        print(f"  Resumed at epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
+
+    print(f"Device: {DEVICE}")
+    print()
+
+    # --- training loop ---
+    for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
-        running_loss = 0.0
-        total = 0
-        correct = 0
 
-        for x, mask, y in train_loader:
-            x = x.to(DEVICE)   # [B, 9, 34]
-            # a mask indicating current hands, which would be valid for discard
-            mask = mask.to(DEVICE) # [B, 34]
-            y = y.to(DEVICE)   # [B]
-
+        # ---- discard training ----
+        d_loss_sum, d_total, d_correct = 0.0, 0, 0
+        for x, mask, y in d_train_loader:
+            x, mask, y = x.to(DEVICE), mask.to(DEVICE), y.to(DEVICE)
             optimizer.zero_grad()
-            logits = model(x)
-
-            # mask out invalid discards that are not currently in hands
-            masked_logits = logits.masked_fill(~mask, -1e9)
-            loss = criterion(masked_logits, y)
+            logits = model.forward_discard(x)
+            masked = logits.masked_fill(~mask, -1e9)
+            loss = discard_criterion(masked, y)
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item() * x.size(0)
-            pred = masked_logits.argmax(dim=1)
-            correct += (pred == y).sum().item()
-            total += x.size(0)
+            d_loss_sum += loss.item() * x.size(0)
+            d_correct += (masked.argmax(dim=1) == y).sum().item()
+            d_total += x.size(0)
 
-        train_loss = running_loss / total
-        train_acc = correct / total
-        val_loss, val_acc = evaluate(model, val_loader, criterion)
+        # ---- call training ----
+        c_loss_sum, c_total, c_correct = 0.0, 0, 0
+        if has_call:
+            for x, y in c_train_loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                optimizer.zero_grad()
+                logits = model.forward_call(x)
+                loss = call_criterion(logits, y) * CALL_LOSS_WEIGHT
+                loss.backward()
+                optimizer.step()
+
+                c_loss_sum += loss.item() * x.size(0)
+                c_correct += (logits.argmax(dim=1) == y).sum().item()
+                c_total += x.size(0)
+
+        scheduler.step()
+
+        # ---- evaluate ----
+        d_val_loss, d_val_top1, d_val_top3 = evaluate_discard(model, d_val_loader, discard_criterion)
+        lr_now = scheduler.get_last_lr()[0]
 
         print(
-            f"Epoch {epoch}/{EPOCHS} | "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+            f"Epoch {epoch:02d}/{EPOCHS} | lr={lr_now:.6f} | "
+            f"discard: loss={d_loss_sum/d_total:.4f} acc={d_correct/d_total:.4f} "
+            f"val_top1={d_val_top1:.4f} val_top3={d_val_top3:.4f}"
         )
 
-    torch.save(model.state_dict(), "toy_mahjong_resnet.pt")
-    print("Saved model to toy_mahjong_resnet.pt")
+        if has_call and c_total > 0:
+            c_val_loss, c_val_acc, c_class_acc = evaluate_call(model, c_val_loader, call_criterion)
+            print(
+                f"         call:    loss={c_loss_sum/c_total:.4f} acc={c_correct/c_total:.4f} "
+                f"val_acc={c_val_acc:.4f} "
+                f"[pass={c_class_acc['pass']:.3f} pon={c_class_acc['pon']:.3f} chi={c_class_acc['chi']:.3f}]"
+            )
+
+        # save best (based on discard val accuracy)
+        if d_val_top1 > best_val_acc:
+            best_val_acc = d_val_top1
+            torch.save(model.state_dict(), BEST_MODEL_PATH)
+            print(f"  -> New best model! val_top1={d_val_top1:.4f}")
+
+        # save checkpoint
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_val_acc": best_val_acc,
+        }, CHECKPOINT_DIR / "latest.pt")
+
+    print(f"\nDone. Best discard val_top1={best_val_acc:.4f}")
+    print(f"Model saved at: {BEST_MODEL_PATH}")
 
 
 if __name__ == "__main__":
