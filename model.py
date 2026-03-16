@@ -28,8 +28,8 @@ class SmallMahjongResNet(nn.Module):
     """
     1D ResNet with two decision heads:
 
-    - discard_head: 34 classes — which tile to discard after tsumo
-    - call_head:    3 classes  — pass(0) / pon(1) / chi(2) when opponent discards
+    - discard_head: 34 classes -- which tile to discard after tsumo
+    - call_head:    3 classes  -- pass(0) / pon(1) / chi(2) when opponent discards
 
     For discard:  input shape [B, 16, 34]
     For call:     input shape [B, 17, 34]  (16 + 1 extra channel for called tile)
@@ -98,7 +98,7 @@ class SmallMahjongResNet(nn.Module):
     def forward_call(self, x):
         """
         x: [B, 17, 34]  (16 game state channels + 1 called tile channel)
-        Returns: [B, 3] call logits — 0=pass, 1=pon, 2=chi
+        Returns: [B, 3] call logits -- 0=pass, 1=pon, 2=chi
         """
         x = self.call_stem(x)
         x = self.blocks(x)

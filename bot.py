@@ -7,10 +7,10 @@ import pathlib
 
 try:
     from .model import SmallMahjongResNet
-    from .gamestate import ToyRoundState, pai_to_idx
+    from .gamestate import ToyRoundState, pai_to_idx, idx_to_pai
 except ImportError:
     from model import SmallMahjongResNet
-    from gamestate import ToyRoundState, pai_to_idx
+    from gamestate import ToyRoundState, pai_to_idx, idx_to_pai
 
 
 # ============================================================
@@ -18,7 +18,7 @@ except ImportError:
 # ============================================================
 
 class Bot:
-    def __init__(self, model_path: str = "checkpoints/best.pt", device: Optional[str] = None):
+    def __init__(self, model_path: str = "./best.pt", device: Optional[str] = None):
         self.player_id: Optional[int] = None
         self.model_path = model_path
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -129,7 +129,6 @@ class Bot:
         if pos <= 6:
             sequences.append((suit_start + pos + 1, suit_start + pos + 2))
 
-        from gamestate import idx_to_pai
         for a, b in sequences:
             if hand_cnts[a] > 0 and hand_cnts[b] > 0:
                 return [idx_to_pai(a), idx_to_pai(b)]
@@ -137,7 +136,6 @@ class Bot:
 
     def _find_pon_consumed(self, tile_idx: int):
         """Find two tiles from hand matching the called tile."""
-        from gamestate import idx_to_pai
         target = idx_to_pai(tile_idx)
         found = []
         for pai in self.round_state.hands[self.player_id]:
@@ -153,15 +151,15 @@ class Bot:
     def _maybe_act(self, last_event: dict) -> Optional[dict]:
         etype = last_event["type"]
 
-        # --- own tsumo: discard decision ---
-        if etype == "tsumo" and last_event["actor"] == self.player_id:
+        # own tsumo OR own chi/pon: discard decision
+        if etype in {"tsumo", "chi", "pon"} and last_event["actor"] == self.player_id:
             idx = self._predict_discard_idx()
             pai = self.round_state.choose_discard_tile(self.player_id, idx)
             return {
                 "type": "dahai",
                 "actor": self.player_id,
                 "pai": pai,
-                "tsumogiri": (self.round_state.last_draw[self.player_id] == pai),
+                "tsumogiri": (etype == "tsumo" and self.round_state.last_draw[self.player_id] == pai),
             }
 
         # --- opponent discard: call decision ---
@@ -208,7 +206,13 @@ class Bot:
 
     def react(self, events: str) -> str:
         try:
-            events = json.loads(events)
+            payload = json.loads(events)
+            if isinstance(payload, dict):
+                events = [payload]
+            elif isinstance(payload, list):
+                events = payload
+            else:
+                raise ValueError(f"Unexpected payload type: {type(payload)}")
         except json.JSONDecodeError as e:
             print(f"Failed to parse events: {events}, {e}", file=sys.stderr)
             return json.dumps({"type": "none"}, separators=(",", ":"))
@@ -234,13 +238,17 @@ class Bot:
             if self.player_id is None or self.round_state is None:
                 continue
 
-            # check for call opportunity BEFORE applying the event
-            # (because after apply, hand state changes)
-            maybe = self._maybe_act(e)
-            if maybe is not None:
-                return_action = maybe
+            if t == "dahai" and e["actor"] != self.player_id:
+                maybe = self._maybe_act(e)
+                if maybe is not None:
+                    return_action = maybe
 
             self.round_state.apply_event(e)
+
+            if t in {"tsumo", "chi", "pon"} and e.get("actor") == self.player_id:
+                maybe = self._maybe_act(e)
+                if maybe is not None:
+                    return_action = maybe
 
         if return_action is None:
             return json.dumps({"type": "none"}, separators=(",", ":"))

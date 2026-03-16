@@ -71,7 +71,7 @@ def idx_to_pai(idx: int) -> str:
 
 
 # ============================================================
-# Enhanced game state tracker â€” 16-channel features
+# Enhanced game state tracker -- 16-channel features
 # ============================================================
 
 class ToyRoundState:
@@ -249,9 +249,9 @@ class ToyRoundState:
 
         # relative opponent seats
         opponents = [
-            (actor + 1) % 4,  # shimocha (ä¸‹å®¶)
-            (actor + 2) % 4,  # toimen   (å¯¾é¢)
-            (actor + 3) % 4,  # kamicha  (ä¸Šå®¶)
+            (actor + 1) % 4,  # shimocha (ÏÂ¼Ò)
+            (actor + 2) % 4,  # toimen   (ŒÃæ)
+            (actor + 3) % 4,  # kamicha  (ÉÏ¼Ò)
         ]
 
         # plane 0: own hand counts
