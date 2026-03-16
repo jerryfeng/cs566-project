@@ -26,16 +26,15 @@ class ResidualBlock1D(nn.Module):
 
 class SmallMahjongResNet(nn.Module):
     """
-    1D ResNet with two decision heads:
+    1D ResNet with three decision heads:
 
-    - discard_head: 34 classes -- which tile to discard after tsumo
-    - call_head:    3 classes  -- pass(0) / pon(1) / chi(2) when opponent discards
+    - discard_head: 34 classes — which tile to discard
+    - call_head:    3 classes  — pass(0) / pon(1) / chi(2)
+    - riichi_head:  2 classes  — no_riichi(0) / riichi(1)
 
-    For discard:  input shape [B, 16, 34]
-    For call:     input shape [B, 17, 34]  (16 + 1 extra channel for called tile)
-
-    The backbone (blocks) is shared. Each task has its own stem to handle
-    different input channel counts, then feeds into the shared blocks.
+    For discard:  input [B, 16, 34]
+    For call:     input [B, 17, 34]  (16 + called tile)
+    For riichi:   input [B, 16, 34]  (same as discard)
     """
 
     def __init__(
@@ -45,6 +44,7 @@ class SmallMahjongResNet(nn.Module):
         num_blocks=6,
         num_discard_classes=34,
         num_call_classes=3,
+        num_riichi_classes=2,
         dropout_block=0.1,
         dropout_head=0.3,
     ):
@@ -65,6 +65,13 @@ class SmallMahjongResNet(nn.Module):
             nn.ReLU(),
         )
 
+        # --- riichi stem: 16 ch -> hidden (shares structure with discard) ---
+        self.riichi_stem = nn.Sequential(
+            nn.Conv1d(in_channels, hidden, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(),
+        )
+
         # --- shared backbone ---
         self.blocks = nn.Sequential(
             *[ResidualBlock1D(hidden, dropout=dropout_block) for _ in range(num_blocks)]
@@ -78,7 +85,7 @@ class SmallMahjongResNet(nn.Module):
             nn.Linear(hidden, num_discard_classes),
         )
 
-        # --- call head: -> 3 (pass / pon / chi) ---
+        # --- call head: -> 3 ---
         self.call_head = nn.Sequential(
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
@@ -86,23 +93,31 @@ class SmallMahjongResNet(nn.Module):
             nn.Linear(hidden, num_call_classes),
         )
 
+        # --- riichi head: -> 2 ---
+        self.riichi_head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Dropout(p=dropout_head),
+            nn.Linear(hidden, num_riichi_classes),
+        )
+
     def forward_discard(self, x):
-        """
-        x: [B, 16, 34]
-        Returns: [B, 34] discard logits
-        """
+        """x: [B, 16, 34] -> [B, 34]"""
         x = self.discard_stem(x)
         x = self.blocks(x)
         return self.discard_head(x)
 
     def forward_call(self, x):
-        """
-        x: [B, 17, 34]  (16 game state channels + 1 called tile channel)
-        Returns: [B, 3] call logits -- 0=pass, 1=pon, 2=chi
-        """
+        """x: [B, 17, 34] -> [B, 3]"""
         x = self.call_stem(x)
         x = self.blocks(x)
         return self.call_head(x)
+
+    def forward_riichi(self, x):
+        """x: [B, 16, 34] -> [B, 2] (0=no_riichi, 1=riichi)"""
+        x = self.riichi_stem(x)
+        x = self.blocks(x)
+        return self.riichi_head(x)
 
     def forward(self, x):
         """Default forward = discard (backward compatible)."""
