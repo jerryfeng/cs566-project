@@ -142,6 +142,7 @@ def train():
     discard_samples, call_samples, riichi_samples = build_dataset(
         DATASET_PATH, YEARS, MAX_FILES,
         MAX_DISCARD_SAMPLES, MAX_CALL_SAMPLES, MAX_RIICHI_SAMPLES,
+        num_workers=6,
     )
 
     if len(discard_samples) < 100:
