@@ -1,11 +1,12 @@
 from pathlib import Path
 from dataloader import (
-    MahjongDiscardDataset, MahjongCallDataset, MahjongRiichiDataset,
-    build_dataset,
+    MahjongDiscardDataset, MahjongCallDataset, MahjongRiichiDataset, PackedMahjongCallDataset, PackedMahjongDiscardDataset, PackedMahjongRiichiDataset,
+    build_dataset, load_processed_dataset,
 )
 import kagglehub
 from model import SmallMahjongResNet
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import random
 from torch.utils.data import DataLoader
@@ -17,17 +18,17 @@ from collections import Counter
 
 DATASET_HANDLE = "shokanekolouis/tenhou-to-mjai"
 DATASET_PATH = Path(kagglehub.dataset_download(DATASET_HANDLE))
-print("DATASET_PATH:", DATASET_PATH)
 
-YEARS = [str(y) for y in range(2023, 2025)]
-MAX_FILES = 5000
-MAX_DISCARD_SAMPLES = 1_000_000
-MAX_CALL_SAMPLES = 500_000
-MAX_RIICHI_SAMPLES = 200_000
+# YEARS = [str(y) for y in range(2023, 2025)]
+# MAX_FILES = 5000
+# MAX_DISCARD_SAMPLES = 1_000_000
+# MAX_CALL_SAMPLES = 300_000
+# MAX_RIICHI_SAMPLES = 50_000
+# NUM_DATA_LOADER_WORKERS = 16
 BATCH_SIZE = 256
-EPOCHS = 50
+EPOCHS = 20
 LR = 3e-4
-WARMUP_EPOCHS = 5
+WARMUP_EPOCHS = 2
 LABEL_SMOOTHING = 0.05
 CALL_LOSS_WEIGHT = 0.5
 RIICHI_LOSS_WEIGHT = 0.3
@@ -46,9 +47,7 @@ if torch.cuda.is_available():
 
 
 def masked_prediction(logits, mask):
-    masked = logits.clone()
-    masked[~mask] = -1e9
-    return masked
+    return logits.masked_fill(~mask, -1e9)
 
 
 def get_lr(epoch, warmup_epochs, max_epochs, base_lr):
@@ -82,19 +81,49 @@ def evaluate_discard(model, loader):
     with torch.no_grad():
         for x, mask, y in loader:
             x, mask, y = x.to(DEVICE), mask.to(DEVICE), y.to(DEVICE)
-            logits = model.forward_discard(x)
-            loss = F.cross_entropy(logits, y, label_smoothing=LABEL_SMOOTHING)
+            logits = masked_prediction(model.forward_discard(x), mask)
+            loss = F.cross_entropy(logits, y)
             total_loss += loss.item() * x.size(0)
             total += x.size(0)
 
-            pred_logits = masked_prediction(logits, mask)
-            correct_top1 += (pred_logits.argmax(dim=1) == y).sum().item()
-            _, top3 = pred_logits.topk(3, dim=1)
+            correct_top1 += (logits.argmax(dim=1) == y).sum().item()
+            _, top3 = logits.topk(3, dim=1)
             correct_top3 += (top3 == y.unsqueeze(1)).any(dim=1).sum().item()
 
     n = max(total, 1)
     return total_loss / n, correct_top1 / n, correct_top3 / n
 
+class AsymmetricCallLoss(nn.Module):
+    def __init__(self, class_weights=None, label_smoothing=0.0, cost_matrix=None, cost_scale=1.0):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=label_smoothing,
+            reduction="none",
+        )
+        self.cost_scale = cost_scale
+
+        if cost_matrix is None:
+            cost_matrix = torch.zeros(3, 3)
+
+        self.register_buffer("cost_matrix", cost_matrix.float())
+
+    def forward(self, logits, targets):
+        # Standard CE per sample
+        ce_loss = self.ce(logits, targets)  # [B]
+
+        # Predicted probabilities
+        probs = torch.softmax(logits, dim=1)  # [B, C]
+
+        # For each sample, pick row = true class
+        # row shape: [B, C]
+        row_costs = self.cost_matrix[targets]
+
+        # Expected penalty under predicted distribution
+        # If true=pass and model puts high prob on chi, penalty is large
+        expected_cost = (row_costs * probs).sum(dim=1)  # [B]
+
+        return (ce_loss + self.cost_scale * expected_cost).mean()
 
 def evaluate_binary(model, loader, criterion, forward_fn):
     """Generic eval for call (3-class) or riichi (2-class)."""
@@ -133,55 +162,115 @@ def evaluate_binary(model, loader, criterion, forward_fn):
 
     return total_loss / n, correct / n, class_acc
 
+def split_packed_dict(packed, train_ratio=0.85, seed=42):
+    n = packed["y"].shape[0]
+
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n, generator=g)
+    split = int(train_ratio * n)
+
+    train_idx = perm[:split]
+    val_idx = perm[split:]
+
+    train_packed = {k: v[train_idx] for k, v in packed.items()}
+    val_packed = {k: v[val_idx] for k, v in packed.items()}
+    return train_packed, val_packed
+
+def compute_class_weights_from_labels(labels: torch.Tensor, num_classes: int) -> torch.Tensor:
+    counts = torch.bincount(labels.long(), minlength=num_classes).float()
+    weights = counts.sum() / counts.clamp(min=1.0)
+    weights = weights / weights.mean()
+    print("class counts:", counts.tolist())
+    print("class weights:", weights.tolist())
+    return weights
 
 # ============================================================
 # Train
 # ============================================================
 
 def train():
-    discard_samples, call_samples, riichi_samples = build_dataset(
-        DATASET_PATH, YEARS, MAX_FILES,
-        MAX_DISCARD_SAMPLES, MAX_CALL_SAMPLES, MAX_RIICHI_SAMPLES,
-        num_workers=6,
-    )
-
-    if len(discard_samples) < 100:
-        print("Too few discard samples.")
-        return
+    discard_samples, call_samples, riichi_samples, meta = load_processed_dataset("./processed_dataset")
+    print(meta)
 
     # --- discard ---
-    random.shuffle(discard_samples)
-    d_split = int(0.85 * len(discard_samples))
-    d_train = MahjongDiscardDataset(discard_samples[:d_split])
-    d_val = MahjongDiscardDataset(discard_samples[d_split:])
-    d_train_loader = DataLoader(d_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
-    d_val_loader = DataLoader(d_val, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+    d_train_packed, d_val_packed = split_packed_dict(discard_samples, train_ratio=0.85, seed=42)
+    d_train = PackedMahjongDiscardDataset(d_train_packed)
+    d_val = PackedMahjongDiscardDataset(d_val_packed)
+
+    d_train_loader = DataLoader(
+        d_train,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        pin_memory=True,
+    )
+    d_val_loader = DataLoader(
+        d_val,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        pin_memory=True,
+    )
 
     # --- call ---
-    has_call = len(call_samples) >= 100
+    has_call = call_samples["y"].shape[0] >= 100
     if has_call:
-        random.shuffle(call_samples)
-        c_split = int(0.85 * len(call_samples))
-        c_train = MahjongCallDataset(call_samples[:c_split])
-        c_val = MahjongCallDataset(call_samples[c_split:])
-        c_train_loader = DataLoader(c_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
-        c_val_loader = DataLoader(c_val, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+        c_train_packed, c_val_packed = split_packed_dict(call_samples, train_ratio=0.85, seed=42)
+        c_train = PackedMahjongCallDataset(c_train_packed)
+        c_val = PackedMahjongCallDataset(c_val_packed)
+
+        c_train_loader = DataLoader(
+            c_train,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            pin_memory=True,
+        )
+        c_val_loader = DataLoader(
+            c_val,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            pin_memory=True,
+        )
+
         print("Call weights:")
-        call_weights = compute_class_weights(call_samples[:c_split], 3).to(DEVICE)
-        call_criterion = torch.nn.CrossEntropyLoss(weight=call_weights, label_smoothing=LABEL_SMOOTHING)
+        call_weights = compute_class_weights_from_labels(c_train_packed["y"], 3).to(DEVICE)
+        call_cost_matrix = torch.tensor([
+            [0.0, 3.0, 5.0],   # true pass
+            [0.5, 0.0, 1.0],   # true pon
+            [0.5, 1.0, 0.0],   # true chi
+        ], dtype=torch.float32)
+
+        call_criterion = AsymmetricCallLoss(
+            class_weights=call_weights,
+            label_smoothing=0.0,
+            cost_matrix=call_cost_matrix,
+            cost_scale=0.5,
+        ).to(DEVICE)
 
     # --- riichi ---
-    has_riichi = len(riichi_samples) >= 100
+    has_riichi = riichi_samples["y"].shape[0] >= 100
     if has_riichi:
-        random.shuffle(riichi_samples)
-        r_split = int(0.85 * len(riichi_samples))
-        r_train = MahjongRiichiDataset(riichi_samples[:r_split])
-        r_val = MahjongRiichiDataset(riichi_samples[r_split:])
-        r_train_loader = DataLoader(r_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
-        r_val_loader = DataLoader(r_val, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+        r_train_packed, r_val_packed = split_packed_dict(riichi_samples, train_ratio=0.85, seed=42)
+        r_train = PackedMahjongRiichiDataset(r_train_packed)
+        r_val = PackedMahjongRiichiDataset(r_val_packed)
+
+        r_train_loader = DataLoader(
+            r_train,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            pin_memory=True,
+        )
+        r_val_loader = DataLoader(
+            r_val,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            pin_memory=True,
+        )
+
         print("Riichi weights:")
-        riichi_weights = compute_class_weights(riichi_samples[:r_split], 2).to(DEVICE)
-        riichi_criterion = torch.nn.CrossEntropyLoss(weight=riichi_weights, label_smoothing=LABEL_SMOOTHING)
+        riichi_weights = compute_class_weights_from_labels(r_train_packed["y"], 2).to(DEVICE)
+        riichi_criterion = torch.nn.CrossEntropyLoss(
+            weight=riichi_weights,
+            label_smoothing=LABEL_SMOOTHING,
+        )
     else:
         print("Not enough riichi samples; skipping riichi training.")
 
@@ -225,15 +314,15 @@ def train():
         for x, mask, y in d_train_loader:
             x, mask, y = x.to(DEVICE), mask.to(DEVICE), y.to(DEVICE)
             optimizer.zero_grad()
-            logits = model.forward_discard(x)
-            loss = F.cross_entropy(logits, y, label_smoothing=LABEL_SMOOTHING)
+            logits = masked_prediction(model.forward_discard(x), mask)
+            loss = F.cross_entropy(logits, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             d_loss_sum += loss.item() * x.size(0)
             d_total += x.size(0)
             with torch.no_grad():
-                d_correct += (masked_prediction(logits, mask).argmax(1) == y).sum().item()
+                d_correct += (logits.argmax(1) == y).sum().item()
 
         # ---- call ----
         c_loss_sum, c_total, c_correct = 0.0, 0, 0

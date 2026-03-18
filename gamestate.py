@@ -52,35 +52,25 @@ def idx_to_pai(idx: int) -> str:
 # ============================================================
 
 def _is_winning_counts(counts: List[int]) -> bool:
-    """
-    Check if a 34-element count array forms a valid winning hand.
-    Standard form: 4 mentsu (sets of 3) + 1 jantai (pair).
-    Also checks for special forms: seven pairs and kokushi.
-    """
     total = sum(counts)
     if total != 14:
         return False
 
-    # --- seven pairs ---
     if sum(1 for c in counts if c == 2) == 7:
         return True
 
-    # --- kokushi musou (thirteen orphans) ---
     terminals = [0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33]
     if all(counts[t] >= 1 for t in terminals):
         has_pair = any(counts[t] >= 2 for t in terminals)
         if has_pair and total == 14:
-            # check no non-terminal tiles
             non_terminal_count = sum(counts[i] for i in range(34) if i not in terminals)
             if non_terminal_count == 0:
                 return True
 
-    # --- standard form: 1 pair + 4 mentsu ---
     return _check_standard_win(counts[:])
 
 
 def _check_standard_win(counts: List[int]) -> bool:
-    """Try each possible pair, then check if remaining tiles form 4 mentsu."""
     for pair_idx in range(34):
         if counts[pair_idx] < 2:
             continue
@@ -93,18 +83,15 @@ def _check_standard_win(counts: List[int]) -> bool:
 
 
 def _remove_mentsu(counts: List[int], needed: int) -> bool:
-    """Recursively try to remove 'needed' mentsu (koutsu or shuntsu) from counts."""
     if needed == 0:
         return all(c == 0 for c in counts)
 
-    # find first non-zero tile
     for i in range(34):
         if counts[i] > 0:
             break
     else:
         return False
 
-    # try koutsu (triplet)
     if counts[i] >= 3:
         counts[i] -= 3
         if _remove_mentsu(counts, needed - 1):
@@ -112,10 +99,9 @@ def _remove_mentsu(counts: List[int], needed: int) -> bool:
             return True
         counts[i] += 3
 
-    # try shuntsu (sequence) — only for number tiles, not honors
     if i < 27:
         suit_pos = i % 9
-        if suit_pos <= 6:  # can form i, i+1, i+2
+        if suit_pos <= 6:
             if counts[i] >= 1 and counts[i + 1] >= 1 and counts[i + 2] >= 1:
                 counts[i] -= 1
                 counts[i + 1] -= 1
@@ -133,22 +119,15 @@ def _remove_mentsu(counts: List[int], needed: int) -> bool:
 
 
 def is_winning_hand(counts: List[int]) -> bool:
-    """Public API: check if 14-tile hand is a winning hand."""
     return _is_winning_counts(counts[:])
 
 
 def is_tenpai(counts: List[int]) -> Tuple[bool, List[int]]:
-    """
-    Check if a 13-tile hand is tenpai (one tile away from winning).
-    Returns (is_tenpai, list_of_waiting_tiles).
-
-    waiting_tiles: list of 34-indices that would complete the hand.
-    """
     assert sum(counts) == 13, f"Expected 13 tiles, got {sum(counts)}"
 
     waiting = []
     for tile in range(34):
-        if counts[tile] >= 4:  # can't draw a 5th copy
+        if counts[tile] >= 4:
             continue
         counts[tile] += 1
         if _is_winning_counts(counts):
@@ -163,22 +142,6 @@ def is_tenpai(counts: List[int]) -> Tuple[bool, List[int]]:
 # ============================================================
 
 class ToyRoundState:
-    """
-    Enhanced state tracker with win/tenpai detection.
-
-    16-channel feature layout:
-        0     : own hand counts
-        1     : own discards
-        2-4   : opponents' discards (shimocha, toimen, kamicha)
-        5     : dora indicators (one-hot)
-        6-8   : opponents' riichi status (broadcast 0/1)
-        9     : own riichi status (broadcast 0/1)
-        10    : round wind / bakaze (broadcast, normalized)
-        11    : seat wind / jikaze (broadcast, normalized)
-        12    : turn number / junme (broadcast, normalized 0-1)
-        13-15 : opponents' open melds (tiles exposed via chi/pon/kan)
-    """
-
     NUM_FEATURE_CHANNELS = 16
 
     def __init__(self):
@@ -199,7 +162,6 @@ class ToyRoundState:
 
         self.junme: int = 0
         self.melds: List[List[int]] = [[0] * 34 for _ in range(4)]
-        # track whether each player has called (not menzen)
         self.has_called: List[bool] = [False, False, False, False]
 
     def start_kyoku(self, event: dict):
@@ -231,19 +193,20 @@ class ToyRoundState:
             counts[pai_to_idx(pai)] += 1
         return counts
 
+    def legal_discard_mask(self, actor: int) -> torch.Tensor:
+        counts = self.hand_counts(actor)
+        return torch.tensor([c > 0 for c in counts], dtype=torch.bool)
+
     def is_menzen(self, actor: int) -> bool:
-        """Check if player is menzen (no open calls: chi/pon/daiminkan)."""
         return not self.has_called[actor]
 
     def check_tsumo_agari(self, actor: int) -> bool:
-        """Check if current hand (14 tiles after tsumo) is a winning hand."""
         counts = self.hand_counts(actor)
         if sum(counts) != 14:
             return False
         return is_winning_hand(counts)
 
     def check_ron(self, actor: int, pai: str) -> bool:
-        """Check if adding pai to hand (13 tiles) makes a winning hand."""
         counts = self.hand_counts(actor)
         if sum(counts) != 13:
             return False
@@ -252,20 +215,12 @@ class ToyRoundState:
         return is_winning_hand(counts)
 
     def check_tenpai(self, actor: int) -> Tuple[bool, List[int]]:
-        """Check if hand (13 tiles) is tenpai. Returns (bool, waiting_tiles)."""
         counts = self.hand_counts(actor)
         if sum(counts) != 13:
             return False, []
         return is_tenpai(counts)
 
     def can_riichi(self, actor: int) -> bool:
-        """
-        Check if player can declare riichi:
-        - menzen (no open calls)
-        - tenpai (13 tiles, waiting for at least 1 tile)
-        - not already in riichi
-        - has >= 1000 points
-        """
         if self.riichi[actor]:
             return False
         if not self.is_menzen(actor):
@@ -274,7 +229,6 @@ class ToyRoundState:
             return False
 
         counts = self.hand_counts(actor)
-        # after tsumo, hand has 14 tiles; need to check if discarding any tile leaves tenpai
         if sum(counts) == 14:
             return self._has_tenpai_discard(counts)
         elif sum(counts) == 13:
@@ -283,7 +237,6 @@ class ToyRoundState:
         return False
 
     def _has_tenpai_discard(self, counts: List[int]) -> bool:
-        """Check if there's any discard that leaves hand in tenpai."""
         for i in range(34):
             if counts[i] > 0:
                 counts[i] -= 1
@@ -294,7 +247,6 @@ class ToyRoundState:
         return False
 
     def find_riichi_discards(self, actor: int) -> List[int]:
-        """Find all tiles that can be discarded to leave hand in tenpai."""
         counts = self.hand_counts(actor)
         if sum(counts) != 14:
             return []
@@ -325,9 +277,10 @@ class ToyRoundState:
         actor = event["actor"]
         pai = event["pai"]
         tsumogiri = event.get("tsumogiri", False)
+
         self.discards[actor][pai_to_idx(pai)] += 1
-        if self.hands[actor]:
-            self._remove_one_tile(self.hands[actor], pai)
+        self._remove_one_tile(self.hands[actor], pai)
+
         if tsumogiri or self.last_draw[actor] == pai:
             self.last_draw[actor] = None
 
@@ -365,7 +318,6 @@ class ToyRoundState:
 
     def on_ankan(self, event: dict):
         actor = event["actor"]
-        # ankan does NOT break menzen
         for t in event.get("consumed", []):
             idx = pai_to_idx(t)
             self.melds[actor][idx] += 1
@@ -454,9 +406,6 @@ class ToyRoundState:
 
         return x
 
-    # ----------------------------------------------------------
-    # Bot helpers
-    # ----------------------------------------------------------
     def choose_discard_tile(self, actor: int, idx: int) -> str:
         if self.last_draw[actor] is not None and pai_to_idx(self.last_draw[actor]) == idx:
             return self.last_draw[actor]
@@ -470,8 +419,14 @@ class ToyRoundState:
         if pai in hand:
             hand.remove(pai)
             return
+
         target_idx = pai_to_idx(pai)
         for i, t in enumerate(hand):
             if pai_to_idx(t) == target_idx:
                 del hand[i]
                 return
+
+        raise ValueError(
+            f"Failed to remove tile {pai} from hand {hand}. "
+            f"State desynced from log."
+        )
