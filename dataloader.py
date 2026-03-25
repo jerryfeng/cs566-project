@@ -3,12 +3,42 @@ import torch
 import gzip
 import random
 import json
-import shutil
 from torch.utils.data import Dataset
 from multiprocessing import Pool
-from functools import partial
 
-from gamestate import ToyRoundState, pai_to_idx, is_tenpai
+from gamestate import RoundState, pai_to_idx
+
+# ============================================================
+# Config
+# ============================================================
+
+DEFAULT_HIST_LEN = 64
+
+# ============================================================
+# Action space for merged "call" dataset
+# ============================================================
+
+CALL_PASS = 0
+CALL_CHI = 1
+CALL_PON = 2
+CALL_HORA = 3
+CALL_DAIMINKAN = 4
+CALL_ANKAN = 5
+CALL_KAKAN = 6
+CALL_RIICHI = 7
+
+NUM_CALL_ACTIONS = 8
+
+CALL_ACTION_NAMES = {
+    CALL_PASS: "none",
+    CALL_CHI: "chi",
+    CALL_PON: "pon",
+    CALL_HORA: "hora",
+    CALL_DAIMINKAN: "daiminkan",
+    CALL_ANKAN: "ankan",
+    CALL_KAKAN: "kakan",
+    CALL_RIICHI: "riichi",
+}
 
 
 def open_mjson(path):
@@ -20,8 +50,16 @@ def open_mjson(path):
         return open(path, "r", encoding="utf-8")
 
 
+# ============================================================
+# Call legality helpers
+# ============================================================
+
 def _can_pon(hand_counts, tile_idx):
     return hand_counts[tile_idx] >= 2
+
+
+def _can_daiminkan(hand_counts, tile_idx):
+    return hand_counts[tile_idx] >= 3
 
 
 def _can_chi(hand_counts, tile_idx):
@@ -38,10 +76,32 @@ def _can_chi(hand_counts, tile_idx):
     return False
 
 
-def _make_call_feature(state, actor, called_tile_idx):
+def _can_ankan(state: RoundState, actor: int) -> bool:
+    hand_counts = state.hand_counts(actor)
+    return any(c >= 4 for c in hand_counts)
+
+
+def _can_kakan(state: RoundState, actor: int) -> bool:
+    # Approximation based on current state representation:
+    # if player has 1 in hand and already has 3 copies exposed in meld tiles,
+    # we treat it as a possible kakan.
+    hand_counts = state.hand_counts(actor)
+    meld_counts = state.melds[actor]
+    for i in range(34):
+        if hand_counts[i] >= 1 and meld_counts[i] == 3:
+            return True
+    return False
+
+
+# ============================================================
+# Feature builders
+# ============================================================
+
+def _make_call_feature(state, actor, called_tile_idx=None):
     feat = state.to_feature(actor)
     called_plane = torch.zeros(1, 34, dtype=torch.float32)
-    called_plane[0, called_tile_idx] = 1.0
+    if called_tile_idx is not None:
+        called_plane[0, called_tile_idx] = 1.0
     return torch.cat([feat, called_plane], dim=0)
 
 
@@ -51,15 +111,69 @@ def _make_discard_feature_and_mask(state, actor):
     return feat, mask
 
 
-def extract_all_from_file(path, max_d=500, max_c=200, max_r=100, max_pass_per_opp=1):
+def _make_discard_sample(state, actor, feat, discard_mask, label, hist_len=DEFAULT_HIST_LEN):
+    hist, hist_mask = state.get_history(observer=actor, max_len=hist_len)
+    return feat, discard_mask.clone(), hist, hist_mask, int(label)
+
+
+def _make_call_sample(state, actor, action_mask, label, called_tile_idx=None, hist_len=DEFAULT_HIST_LEN):
+    feat = _make_call_feature(state, actor, called_tile_idx)
+    hist, hist_mask = state.get_history(observer=actor, max_len=hist_len)
+    return feat, action_mask.clone(), hist, hist_mask, int(label)
+
+
+def _build_discard_reaction_mask(state: RoundState, player: int, discarder: int, pai: str, pai_idx: int):
+    hand_counts = state.hand_counts(player)
+    mask = torch.zeros(NUM_CALL_ACTIONS, dtype=torch.bool)
+
+    can_hora = state.check_ron(player, pai)
+    can_pon = _can_pon(hand_counts, pai_idx)
+    can_daiminkan = _can_daiminkan(hand_counts, pai_idx)
+    can_chi = (player == (discarder + 1) % 4) and _can_chi(hand_counts, pai_idx)
+
+    mask[CALL_CHI] = can_chi
+    mask[CALL_PON] = can_pon
+    mask[CALL_HORA] = can_hora
+    mask[CALL_DAIMINKAN] = can_daiminkan
+
+    if mask.any():
+        mask[CALL_PASS] = True
+
+    return mask
+
+
+def _build_self_action_mask(state: RoundState, actor: int):
+    mask = torch.zeros(NUM_CALL_ACTIONS, dtype=torch.bool)
+
+    mask[CALL_HORA] = state.check_tsumo_agari(actor)
+    mask[CALL_ANKAN] = _can_ankan(state, actor)
+    mask[CALL_KAKAN] = _can_kakan(state, actor)
+    mask[CALL_RIICHI] = state.can_riichi(actor)
+
+    if mask.any():
+        mask[CALL_PASS] = True
+
+    return mask
+
+
+# ============================================================
+# Main extraction
+# ============================================================
+
+def extract_all_from_file(path, max_d=500, max_c=300, max_pass_per_opp=1, hist_len=DEFAULT_HIST_LEN):
+    """
+    Returns:
+      d_samples: list[(feat, discard_mask, hist, hist_mask, discard_label)]
+      c_samples: list[(feat, call_action_mask, hist, hist_mask, call_label)]
+    """
     d_samples = []
     c_samples = []
-    r_samples = []
 
-    state = ToyRoundState()
+    state = RoundState()
     discard_pending = None
+
     call_pending_dahai = None
-    riichi_pending_actor = None
+    pending_self_action = None
 
     def _d_full():
         return max_d <= 0 or len(d_samples) >= max_d
@@ -67,17 +181,48 @@ def extract_all_from_file(path, max_d=500, max_c=200, max_r=100, max_pass_per_op
     def _c_full():
         return max_c <= 0 or len(c_samples) >= max_c
 
-    def _r_full():
-        return max_r <= 0 or len(r_samples) >= max_r
+    def _flush_pending_discard_reactions():
+        nonlocal call_pending_dahai
+        if call_pending_dahai is None or _c_full():
+            call_pending_dahai = None
+            return
+
+        _add_discard_pass_samples(
+            state=state,
+            pending_dahai=call_pending_dahai,
+            samples=c_samples,
+            max_pass=max_pass_per_opp,
+            hist_len=hist_len,
+        )
+        call_pending_dahai = None
+
+    def _flush_pending_self_action_as_pass():
+        nonlocal pending_self_action
+        if pending_self_action is None or _c_full():
+            pending_self_action = None
+            return
+
+        actor = pending_self_action["actor"]
+        mask = pending_self_action["mask"]
+        if mask[CALL_PASS]:
+            c_samples.append(
+                _make_call_sample(
+                    state, actor, mask, CALL_PASS,
+                    called_tile_idx=None,
+                    hist_len=hist_len,
+                )
+            )
+        pending_self_action = None
 
     with open_mjson(path) as f:
         for line in f:
-            if _d_full() and _c_full() and _r_full():
+            if _d_full() and _c_full():
                 break
 
             line = line.strip()
             if not line:
                 continue
+
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
@@ -85,19 +230,27 @@ def extract_all_from_file(path, max_d=500, max_c=200, max_r=100, max_pass_per_op
 
             etype = event.get("type")
 
+            # ---------------------------------------------------
+            # start_kyoku
+            # ---------------------------------------------------
             if etype == "start_kyoku":
+                _flush_pending_discard_reactions()
+                _flush_pending_self_action_as_pass()
+
                 discard_pending = None
                 call_pending_dahai = None
-                riichi_pending_actor = None
+                pending_self_action = None
                 state.apply_event(event)
                 continue
 
+            # ---------------------------------------------------
+            # tsumo
+            # ---------------------------------------------------
             if etype == "tsumo":
                 actor = event.get("actor")
 
-                if call_pending_dahai is not None and not _c_full():
-                    _add_pass_samples(state, call_pending_dahai, c_samples, max_pass_per_opp)
-                call_pending_dahai = None
+                _flush_pending_discard_reactions()
+                _flush_pending_self_action_as_pass()
 
                 state.apply_event(event)
 
@@ -107,37 +260,78 @@ def extract_all_from_file(path, max_d=500, max_c=200, max_r=100, max_pass_per_op
                 else:
                     discard_pending = None
 
-                riichi_pending_actor = None
-                if actor is not None and not _r_full():
-                    if state.is_menzen(actor) and not state.riichi[actor] and state.can_riichi(actor):
-                        riichi_pending_actor = actor
+                pending_self_action = None
+                if actor is not None and not _c_full():
+                    self_mask = _build_self_action_mask(state, actor)
+                    if self_mask.any():
+                        pending_self_action = {
+                            "actor": actor,
+                            "mask": self_mask,
+                        }
                 continue
 
+            # ---------------------------------------------------
+            # reach -> merged into call actions
+            # ---------------------------------------------------
             if etype == "reach":
                 actor = event.get("actor")
-                if actor is not None and actor == riichi_pending_actor and not _r_full():
-                    feat = state.to_feature(actor)
-                    r_samples.append((feat, 1))
-                riichi_pending_actor = None
+
+                if pending_self_action is not None and actor == pending_self_action["actor"] and not _c_full():
+                    mask = pending_self_action["mask"]
+                    if mask[CALL_RIICHI]:
+                        c_samples.append(
+                            _make_call_sample(
+                                state, actor, mask, CALL_RIICHI,
+                                called_tile_idx=None,
+                                hist_len=hist_len,
+                            )
+                        )
+                    elif mask[CALL_PASS]:
+                        c_samples.append(
+                            _make_call_sample(
+                                state, actor, mask, CALL_PASS,
+                                called_tile_idx=None,
+                                hist_len=hist_len,
+                            )
+                        )
+
+                pending_self_action = None
                 discard_pending = None
                 state.apply_event(event)
                 continue
 
+            # ---------------------------------------------------
+            # dahai
+            # ---------------------------------------------------
             if etype == "dahai":
                 actor = event.get("actor")
                 pai = event.get("pai")
 
-                if riichi_pending_actor is not None and actor == riichi_pending_actor and not _r_full():
-                    feat = state.to_feature(actor)
-                    r_samples.append((feat, 0))
-                riichi_pending_actor = None
+                if pending_self_action is not None and actor == pending_self_action["actor"] and not _c_full():
+                    mask = pending_self_action["mask"]
+                    if mask[CALL_PASS]:
+                        c_samples.append(
+                            _make_call_sample(
+                                state, actor, mask, CALL_PASS,
+                                called_tile_idx=None,
+                                hist_len=hist_len,
+                            )
+                        )
+                    pending_self_action = None
+                else:
+                    _flush_pending_self_action_as_pass()
 
                 if discard_pending is not None and not _d_full():
                     p_actor, feat, mask = discard_pending
                     if actor == p_actor and pai is not None:
                         label = pai_to_idx(pai)
                         if mask[label]:
-                            d_samples.append((feat, mask, label))
+                            d_samples.append(
+                                _make_discard_sample(
+                                    state, actor, feat, mask, label,
+                                    hist_len=hist_len,
+                                )
+                            )
                         else:
                             raise ValueError(
                                 f"Discard label {pai} / idx={label} not in mask for actor={actor} "
@@ -145,8 +339,7 @@ def extract_all_from_file(path, max_d=500, max_c=200, max_r=100, max_pass_per_op
                             )
                 discard_pending = None
 
-                if call_pending_dahai is not None and not _c_full():
-                    _add_pass_samples(state, call_pending_dahai, c_samples, max_pass_per_opp)
+                _flush_pending_discard_reactions()
 
                 state.apply_event(event)
 
@@ -155,100 +348,239 @@ def extract_all_from_file(path, max_d=500, max_c=200, max_r=100, max_pass_per_op
                         "actor": actor,
                         "pai": pai,
                         "pai_idx": pai_to_idx(pai),
+                        "resolved": set(),
                     }
                 else:
                     call_pending_dahai = None
                 continue
 
-            if etype == "pon":
+            # ---------------------------------------------------
+            # chi / pon / daiminkan from another player's discard
+            # ---------------------------------------------------
+            if etype in {"chi", "pon", "daiminkan"}:
                 actor = event.get("actor")
+
                 if call_pending_dahai is not None and actor is not None and not _c_full():
-                    feat = _make_call_feature(state, actor, call_pending_dahai["pai_idx"])
-                    c_samples.append((feat, 1))
+                    discarder = call_pending_dahai["actor"]
+                    pai = call_pending_dahai["pai"]
+                    pai_idx = call_pending_dahai["pai_idx"]
+
+                    mask = _build_discard_reaction_mask(state, actor, discarder, pai, pai_idx)
+
+                    label = {
+                        "chi": CALL_CHI,
+                        "pon": CALL_PON,
+                        "daiminkan": CALL_DAIMINKAN,
+                    }[etype]
+
+                    if mask[label]:
+                        c_samples.append(
+                            _make_call_sample(
+                                state, actor, mask, label,
+                                called_tile_idx=pai_idx,
+                                hist_len=hist_len,
+                            )
+                        )
+                        call_pending_dahai["resolved"].add(actor)
+
+                    _add_discard_pass_samples(
+                        state=state,
+                        pending_dahai=call_pending_dahai,
+                        samples=c_samples,
+                        max_pass=max_pass_per_opp,
+                        hist_len=hist_len,
+                    )
 
                 call_pending_dahai = None
                 discard_pending = None
-                riichi_pending_actor = None
+                pending_self_action = None
 
                 state.apply_event(event)
 
-                # after pon, actor must discard immediately
-                if actor is not None and not _d_full():
+                if etype in {"chi", "pon"} and actor is not None and not _d_full():
                     feat, mask = _make_discard_feature_and_mask(state, actor)
                     discard_pending = (actor, feat, mask)
+
                 continue
 
-            if etype == "chi":
+            # ---------------------------------------------------
+            # ankan / kakan from self draw
+            # ---------------------------------------------------
+            if etype in {"ankan", "kakan"}:
                 actor = event.get("actor")
-                if call_pending_dahai is not None and actor is not None and not _c_full():
-                    feat = _make_call_feature(state, actor, call_pending_dahai["pai_idx"])
-                    c_samples.append((feat, 2))
 
-                call_pending_dahai = None
+                if pending_self_action is not None and actor == pending_self_action["actor"] and not _c_full():
+                    mask = pending_self_action["mask"]
+                    label = CALL_ANKAN if etype == "ankan" else CALL_KAKAN
+                    if mask[label]:
+                        c_samples.append(
+                            _make_call_sample(
+                                state, actor, mask, label,
+                                called_tile_idx=None,
+                                hist_len=hist_len,
+                            )
+                        )
+                    elif mask[CALL_PASS]:
+                        c_samples.append(
+                            _make_call_sample(
+                                state, actor, mask, CALL_PASS,
+                                called_tile_idx=None,
+                                hist_len=hist_len,
+                            )
+                        )
+
+                pending_self_action = None
                 discard_pending = None
-                riichi_pending_actor = None
 
                 state.apply_event(event)
-
-                # after chi, actor must discard immediately
-                if actor is not None and not _d_full():
-                    feat, mask = _make_discard_feature_and_mask(state, actor)
-                    discard_pending = (actor, feat, mask)
                 continue
 
-            if etype in {"daiminkan", "ankan", "kakan", "hora", "ryukyoku", "end_kyoku"}:
-                discard_pending = None
-                call_pending_dahai = None
-                riichi_pending_actor = None
+            # ---------------------------------------------------
+            # hora: either ron on a discard, or tsumo on self draw
+            # ---------------------------------------------------
+            if etype == "hora":
+                actor = event.get("actor")
+
+                handled = False
+
+                if (
+                    call_pending_dahai is not None
+                    and actor is not None
+                    and actor != call_pending_dahai["actor"]
+                    and not _c_full()
+                ):
+                    discarder = call_pending_dahai["actor"]
+                    pai = call_pending_dahai["pai"]
+                    pai_idx = call_pending_dahai["pai_idx"]
+
+                    mask = _build_discard_reaction_mask(state, actor, discarder, pai, pai_idx)
+                    if mask[CALL_HORA]:
+                        c_samples.append(
+                            _make_call_sample(
+                                state, actor, mask, CALL_HORA,
+                                called_tile_idx=pai_idx,
+                                hist_len=hist_len,
+                            )
+                        )
+                        call_pending_dahai["resolved"].add(actor)
+                        handled = True
+
+                if (
+                    not handled
+                    and pending_self_action is not None
+                    and actor is not None
+                    and actor == pending_self_action["actor"]
+                    and not _c_full()
+                ):
+                    mask = pending_self_action["mask"]
+                    if mask[CALL_HORA]:
+                        c_samples.append(
+                            _make_call_sample(
+                                state, actor, mask, CALL_HORA,
+                                called_tile_idx=None,
+                                hist_len=hist_len,
+                            )
+                        )
+                    elif mask[CALL_PASS]:
+                        c_samples.append(
+                            _make_call_sample(
+                                state, actor, mask, CALL_PASS,
+                                called_tile_idx=None,
+                                hist_len=hist_len,
+                            )
+                        )
+                    pending_self_action = None
+                    discard_pending = None
+                    handled = True
+
+                if (
+                    not handled
+                    and pending_self_action is not None
+                    and actor is not None
+                    and actor == pending_self_action["actor"]
+                    and not _c_full()
+                ):
+                    mask = pending_self_action["mask"]
+                    if mask[CALL_HORA]:
+                        c_samples.append(
+                            _make_call_sample(
+                                state, actor, mask, CALL_HORA,
+                                called_tile_idx=None,
+                                hist_len=hist_len,
+                            )
+                        )
+                    pending_self_action = None
+                    discard_pending = None
+
                 state.apply_event(event)
                 continue
 
+            # ---------------------------------------------------
+            # end_kyoku
+            # ---------------------------------------------------
+            if etype == "end_kyoku":
+                _flush_pending_self_action_as_pass()
+                _flush_pending_discard_reactions()
+
+                discard_pending = None
+                state.apply_event(event)
+                continue
+
+            # ---------------------------------------------------
+            # other events
+            # ---------------------------------------------------
             state.apply_event(event)
 
-    return d_samples, c_samples, r_samples
+    if not _c_full():
+        if pending_self_action is not None:
+            actor = pending_self_action["actor"]
+            mask = pending_self_action["mask"]
+            if mask[CALL_PASS]:
+                c_samples.append(
+                    _make_call_sample(
+                        state, actor, mask, CALL_PASS,
+                        called_tile_idx=None,
+                        hist_len=hist_len,
+                    )
+                )
+
+        if call_pending_dahai is not None:
+            _add_discard_pass_samples(
+                state=state,
+                pending_dahai=call_pending_dahai,
+                samples=c_samples,
+                max_pass=max_pass_per_opp,
+                hist_len=hist_len,
+            )
+
+    return d_samples, c_samples
 
 
-def _add_pass_samples(state, pending_dahai, samples, max_pass):
+def _add_discard_pass_samples(state, pending_dahai, samples, max_pass, hist_len=DEFAULT_HIST_LEN):
     discarder = pending_dahai["actor"]
+    pai = pending_dahai["pai"]
     pai_idx = pending_dahai["pai_idx"]
+    resolved = pending_dahai.get("resolved", set())
+
     added = 0
     for player in range(4):
         if player == discarder:
             continue
+        if player in resolved:
+            continue
         if added >= max_pass:
             break
-        hand_cnts = state.hand_counts(player)
-        can_p = _can_pon(hand_cnts, pai_idx)
-        can_c = (player == (discarder + 1) % 4) and _can_chi(hand_cnts, pai_idx)
-        if can_p or can_c:
-            feat = _make_call_feature(state, player, pai_idx)
-            samples.append((feat, 0))
+
+        mask = _build_discard_reaction_mask(state, player, discarder, pai, pai_idx)
+        if mask[CALL_PASS]:
+            samples.append(
+                _make_call_sample(
+                    state, player, mask, CALL_PASS,
+                    called_tile_idx=pai_idx,
+                    hist_len=hist_len,
+                )
+            )
             added += 1
-
-
-# ============================================================
-# Backward-compatible single-type extractors
-# ============================================================
-
-def extract_discard_samples(path, max_samples):
-    d, _, _ = extract_all_from_file(path, max_d=max_samples, max_c=0, max_r=0)
-    return d
-
-
-def extract_call_samples(path, max_samples, max_pass_per_opportunity=1):
-    _, c, _ = extract_all_from_file(
-        path,
-        max_d=0,
-        max_c=max_samples,
-        max_r=0,
-        max_pass_per_opp=max_pass_per_opportunity,
-    )
-    return c
-
-
-def extract_riichi_samples(path, max_samples):
-    _, _, r = extract_all_from_file(path, max_d=0, max_c=0, max_r=max_samples)
-    return r
 
 
 # ============================================================
@@ -277,66 +609,56 @@ def pack_discard_samples(samples):
         return {
             "x": torch.empty((0, 0, 34), dtype=torch.float32),
             "mask": torch.empty((0, 34), dtype=torch.bool),
+            "hist": torch.empty((0, DEFAULT_HIST_LEN, 8), dtype=torch.long),
+            "hist_mask": torch.empty((0, DEFAULT_HIST_LEN), dtype=torch.bool),
             "y": torch.empty((0,), dtype=torch.long),
         }
 
     x = torch.stack([s[0] for s in samples]).float()
     mask = torch.stack([s[1] for s in samples]).bool()
-    y = torch.tensor([s[2] for s in samples], dtype=torch.long)
-    return {"x": x, "mask": mask, "y": y}
+    hist = torch.stack([s[2] for s in samples]).long()
+    hist_mask = torch.stack([s[3] for s in samples]).bool()
+    y = torch.tensor([s[4] for s in samples], dtype=torch.long)
+    return {"x": x, "mask": mask, "hist": hist, "hist_mask": hist_mask, "y": y}
 
 
 def pack_call_samples(samples):
     if not samples:
         return {
             "x": torch.empty((0, 0, 34), dtype=torch.float32),
+            "mask": torch.empty((0, NUM_CALL_ACTIONS), dtype=torch.bool),
+            "hist": torch.empty((0, DEFAULT_HIST_LEN, 8), dtype=torch.long),
+            "hist_mask": torch.empty((0, DEFAULT_HIST_LEN), dtype=torch.bool),
             "y": torch.empty((0,), dtype=torch.long),
         }
 
     x = torch.stack([s[0] for s in samples]).float()
-    y = torch.tensor([s[1] for s in samples], dtype=torch.long)
-    return {"x": x, "y": y}
-
-
-def pack_riichi_samples(samples):
-    if not samples:
-        return {
-            "x": torch.empty((0, 0, 34), dtype=torch.float32),
-            "y": torch.empty((0,), dtype=torch.long),
-        }
-
-    x = torch.stack([s[0] for s in samples]).float()
-    y = torch.tensor([s[1] for s in samples], dtype=torch.long)
-    return {"x": x, "y": y}
+    mask = torch.stack([s[1] for s in samples]).bool()
+    hist = torch.stack([s[2] for s in samples]).long()
+    hist_mask = torch.stack([s[3] for s in samples]).bool()
+    y = torch.tensor([s[4] for s in samples], dtype=torch.long)
+    return {"x": x, "mask": mask, "hist": hist, "hist_mask": hist_mask, "y": y}
 
 
 # ============================================================
 # Shard save/load/merge
 # ============================================================
 
-def _save_shard(shard_path, d_samples, c_samples, r_samples, source_path=None):
+def _save_shard(shard_path, d_samples, c_samples, source_path=None):
     shard = {
         "discard": pack_discard_samples(d_samples),
         "call": pack_call_samples(c_samples),
-        "riichi": pack_riichi_samples(r_samples),
         "counts": {
             "discard": len(d_samples),
             "call": len(c_samples),
-            "riichi": len(r_samples),
         },
         "source_path": str(source_path) if source_path is not None else None,
     }
     torch.save(shard, shard_path)
 
 
-def _concat_or_empty(tensors, empty_shape, dtype):
-    if not tensors:
-        return torch.empty(empty_shape, dtype=dtype)
-    return torch.cat(tensors, dim=0)
-
-
 def _merge_packed_discard(parts, max_samples):
-    xs, masks, ys = [], [], []
+    xs, masks, hists, hist_masks, ys = [], [], [], [], []
     total = 0
 
     for part in parts:
@@ -344,12 +666,18 @@ def _merge_packed_discard(parts, max_samples):
             break
         x = part["x"]
         mask = part["mask"]
+        hist = part["hist"]
+        hist_mask = part["hist_mask"]
         y = part["y"]
+
         take = min(x.shape[0], max_samples - total)
         if take <= 0:
             break
+
         xs.append(x[:take])
         masks.append(mask[:take])
+        hists.append(hist[:take])
+        hist_masks.append(hist_mask[:take])
         ys.append(y[:take])
         total += take
 
@@ -357,40 +685,58 @@ def _merge_packed_discard(parts, max_samples):
         return {
             "x": torch.cat(xs, dim=0),
             "mask": torch.cat(masks, dim=0),
+            "hist": torch.cat(hists, dim=0),
+            "hist_mask": torch.cat(hist_masks, dim=0),
             "y": torch.cat(ys, dim=0),
         }
 
     return {
         "x": torch.empty((0, 0, 34), dtype=torch.float32),
         "mask": torch.empty((0, 34), dtype=torch.bool),
+        "hist": torch.empty((0, DEFAULT_HIST_LEN, 8), dtype=torch.long),
+        "hist_mask": torch.empty((0, DEFAULT_HIST_LEN), dtype=torch.bool),
         "y": torch.empty((0,), dtype=torch.long),
     }
 
 
-def _merge_packed_simple(parts, max_samples):
-    xs, ys = [], []
+def _merge_packed_call(parts, max_samples):
+    xs, masks, hists, hist_masks, ys = [], [], [], [], []
     total = 0
 
     for part in parts:
         if total >= max_samples:
             break
         x = part["x"]
+        mask = part["mask"]
+        hist = part["hist"]
+        hist_mask = part["hist_mask"]
         y = part["y"]
+
         take = min(x.shape[0], max_samples - total)
         if take <= 0:
             break
+
         xs.append(x[:take])
+        masks.append(mask[:take])
+        hists.append(hist[:take])
+        hist_masks.append(hist_mask[:take])
         ys.append(y[:take])
         total += take
 
     if xs:
         return {
             "x": torch.cat(xs, dim=0),
+            "mask": torch.cat(masks, dim=0),
+            "hist": torch.cat(hists, dim=0),
+            "hist_mask": torch.cat(hist_masks, dim=0),
             "y": torch.cat(ys, dim=0),
         }
 
     return {
         "x": torch.empty((0, 0, 34), dtype=torch.float32),
+        "mask": torch.empty((0, NUM_CALL_ACTIONS), dtype=torch.bool),
+        "hist": torch.empty((0, DEFAULT_HIST_LEN, 8), dtype=torch.long),
+        "hist_mask": torch.empty((0, DEFAULT_HIST_LEN), dtype=torch.bool),
         "y": torch.empty((0,), dtype=torch.long),
     }
 
@@ -400,7 +746,6 @@ def merge_dataset_shards(
     out_dir,
     max_discard_samples,
     max_call_samples,
-    max_riichi_samples,
     meta=None,
     cleanup_shards=False,
 ):
@@ -409,29 +754,24 @@ def merge_dataset_shards(
 
     discard_parts = []
     call_parts = []
-    riichi_parts = []
 
     for shard_path in shard_paths:
         shard = torch.load(shard_path, weights_only=False)
         discard_parts.append(shard["discard"])
         call_parts.append(shard["call"])
-        riichi_parts.append(shard["riichi"])
 
     discard_data = _merge_packed_discard(discard_parts, max_discard_samples)
-    call_data = _merge_packed_simple(call_parts, max_call_samples)
-    riichi_data = _merge_packed_simple(riichi_parts, max_riichi_samples)
+    call_data = _merge_packed_call(call_parts, max_call_samples)
 
     torch.save(discard_data, out_dir / "discard.pt")
     torch.save(call_data, out_dir / "call.pt")
-    torch.save(riichi_data, out_dir / "riichi.pt")
 
     if meta is not None:
         torch.save(meta, out_dir / "meta.pt")
 
     print(
         f"Merged shards -> discard={discard_data['y'].shape[0]}, "
-        f"call={call_data['y'].shape[0]}, "
-        f"riichi={riichi_data['y'].shape[0]}"
+        f"call={call_data['y'].shape[0]}"
     )
 
     if cleanup_shards:
@@ -441,7 +781,7 @@ def merge_dataset_shards(
             except FileNotFoundError:
                 pass
 
-    return discard_data, call_data, riichi_data
+    return discard_data, call_data
 
 
 # ============================================================
@@ -449,25 +789,24 @@ def merge_dataset_shards(
 # ============================================================
 
 def _worker_to_shard(task):
-    idx, path, per_file_d, per_file_c, per_file_r, shard_dir = task
+    idx, path, per_file_d, per_file_c, shard_dir, hist_len = task
     shard_dir = Path(shard_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
     shard_path = shard_dir / f"shard_{idx:06d}.pt"
 
     try:
-        d_samples, c_samples, r_samples = extract_all_from_file(
+        d_samples, c_samples = extract_all_from_file(
             path,
             max_d=per_file_d,
             max_c=per_file_c,
-            max_r=per_file_r,
+            hist_len=hist_len,
         )
-        _save_shard(shard_path, d_samples, c_samples, r_samples, source_path=path)
+        _save_shard(shard_path, d_samples, c_samples, source_path=path)
         return {
             "ok": True,
             "shard_path": str(shard_path),
             "discard": len(d_samples),
             "call": len(c_samples),
-            "riichi": len(r_samples),
         }
     except Exception as e:
         print(f"Error processing {path}: {e}")
@@ -476,7 +815,6 @@ def _worker_to_shard(task):
             "shard_path": None,
             "discard": 0,
             "call": 0,
-            "riichi": 0,
         }
 
 
@@ -490,70 +828,110 @@ def build_dataset_shards(
     max_files,
     max_discard_samples,
     max_call_samples,
-    max_riichi_samples=0,
     num_workers=4,
     shard_dir="./processed_dataset/shards",
+    hist_len=DEFAULT_HIST_LEN,
 ):
-    """
-    Workers scan files and write shard .pt files.
-    Parent only tracks shard paths and counts.
-    """
     files = find_gz_files(Path(root_dir), years, max_files)
     print(f"Found {len(files)} files, scanning with {num_workers} workers...")
 
-    per_d = max(max_discard_samples // max(len(files), 1) * 3, 400) if max_discard_samples > 0 else 0
-    per_c = max(max_call_samples // max(len(files), 1) * 3, 200) if max_call_samples > 0 else 0
-    per_r = max(max_riichi_samples // max(len(files), 1) * 3, 100) if max_riichi_samples > 0 else 0
+    base_per_d = (
+        max(max_discard_samples // max(len(files), 1) * 3, 500)
+        if max_discard_samples > 0 else 0
+    )
+    base_per_c = (
+        max(max_call_samples // max(len(files), 1) * 3, 500)
+        if max_call_samples > 0 else 0
+    )
 
     shard_dir = Path(shard_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = [
-        (i, path, per_d, per_c, per_r, str(shard_dir))
-        for i, path in enumerate(files)
-    ]
-
     shard_paths = []
     total_d = 0
     total_c = 0
-    total_r = 0
+
+    def discard_done():
+        return (max_discard_samples > 0) and (total_d >= max_discard_samples)
+
+    def call_done():
+        return (max_call_samples > 0) and (total_c >= max_call_samples)
+
+    def both_done():
+        d_ok = (max_discard_samples <= 0) or (total_d >= max_discard_samples)
+        c_ok = (max_call_samples <= 0) or (total_c >= max_call_samples)
+        return d_ok and c_ok
+
+    def make_task(file_idx):
+        per_d = 0 if discard_done() else base_per_d
+        per_c = 0 if call_done() else base_per_c
+        return (file_idx, files[file_idx], per_d, per_c, str(shard_dir), hist_len)
 
     if num_workers <= 1:
-        iterator = map(_worker_to_shard, tasks)
-        pool = None
-    else:
-        pool = Pool(num_workers)
-        iterator = pool.imap_unordered(_worker_to_shard, tasks)
+        scanned = 0
+        for file_idx in range(len(files)):
+            if both_done():
+                print("Reached requested sample targets. Stopping early.")
+                break
 
-    try:
-        for i, result in enumerate(iterator, 1):
+            task = make_task(file_idx)
+            result = _worker_to_shard(task)
+            scanned += 1
+
             if not result["ok"]:
                 continue
 
             shard_paths.append(result["shard_path"])
             total_d += result["discard"]
             total_c += result["call"]
-            total_r += result["riichi"]
 
-            d_done = (max_discard_samples <= 0) or (total_d >= max_discard_samples)
-            c_done = (max_call_samples <= 0) or (total_c >= max_call_samples)
-            r_done = (max_riichi_samples <= 0) or (total_r >= max_riichi_samples)
+            if scanned % 100 == 0:
+                print(f"Scanned {scanned}/{len(files)} -> d={total_d}, c={total_c}")
 
-            if i % 100 == 0:
-                parts = [f"d={total_d}", f"c={total_c}"]
-                if max_riichi_samples > 0:
-                    parts.append(f"r={total_r}")
-                print(f"Scanned {i}/{len(files)} -> {', '.join(parts)}")
+    else:
+        pool = Pool(num_workers)
+        pending = []
+        next_file_idx = 0
+        scanned = 0
 
-            if d_done and c_done and r_done:
-                print("Reached requested sample targets. Stopping worker pool early.")
-                break
-    finally:
-        if pool is not None:
+        try:
+            # Initial fill
+            while next_file_idx < len(files) and len(pending) < num_workers and not both_done():
+                task = make_task(next_file_idx)
+                pending.append(pool.apply_async(_worker_to_shard, (task,)))
+                next_file_idx += 1
+
+            while pending:
+                new_pending = []
+
+                for job in pending:
+                    result = job.get()
+                    scanned += 1
+
+                    if result["ok"]:
+                        shard_paths.append(result["shard_path"])
+                        total_d += result["discard"]
+                        total_c += result["call"]
+
+                    if scanned % 100 == 0:
+                        print(f"Scanned {scanned}/{len(files)} -> d={total_d}, c={total_c}")
+
+                    if not both_done() and next_file_idx < len(files):
+                        task = make_task(next_file_idx)
+                        new_pending.append(pool.apply_async(_worker_to_shard, (task,)))
+                        next_file_idx += 1
+
+                pending = new_pending
+
+                if both_done():
+                    print("Reached requested sample targets. Stopping worker pool early.")
+                    break
+
+        finally:
             pool.terminate()
             pool.join()
 
-    print(f"Shard build complete: discard={total_d}, call={total_c}, riichi={total_r}")
+    print(f"Shard build complete: discard={total_d}, call={total_c}")
     return shard_paths
 
 
@@ -563,12 +941,12 @@ def build_and_save_dataset(
     max_files,
     max_discard_samples,
     max_call_samples,
-    max_riichi_samples=0,
     num_workers=4,
     out_dir="./processed_dataset",
     shard_subdir="shards",
     meta=None,
     cleanup_shards=False,
+    hist_len=DEFAULT_HIST_LEN,
 ):
     out_dir = Path(out_dir)
     shard_dir = out_dir / shard_subdir
@@ -579,55 +957,54 @@ def build_and_save_dataset(
         max_files=max_files,
         max_discard_samples=max_discard_samples,
         max_call_samples=max_call_samples,
-        max_riichi_samples=max_riichi_samples,
         num_workers=num_workers,
         shard_dir=shard_dir,
+        hist_len=hist_len,
     )
 
-    discard, call, riichi = merge_dataset_shards(
+    discard, call = merge_dataset_shards(
         shard_paths=shard_paths,
         out_dir=out_dir,
         max_discard_samples=max_discard_samples,
         max_call_samples=max_call_samples,
-        max_riichi_samples=max_riichi_samples,
         meta=meta,
         cleanup_shards=cleanup_shards,
     )
 
-    return discard, call, riichi, shard_paths
+    return discard, call, shard_paths
 
 
-# backward compat
 def build_dataset(root_dir, years, max_files,
-                  max_discard_samples, max_call_samples, max_riichi_samples=0,
-                  num_workers=4):
-    """
-    Old API kept for compatibility.
-    This now builds temp shards, merges them, then returns unpacked sample tuples.
-    Avoid using this for very large datasets if you want lower RAM usage.
-    """
+                  max_discard_samples, max_call_samples,
+                  num_workers=4, hist_len=DEFAULT_HIST_LEN):
     tmp_out = Path("./_tmp_processed_dataset_compat")
-    discard, call, riichi, _ = build_and_save_dataset(
+    discard, call, _ = build_and_save_dataset(
         root_dir=root_dir,
         years=years,
         max_files=max_files,
         max_discard_samples=max_discard_samples,
         max_call_samples=max_call_samples,
-        max_riichi_samples=max_riichi_samples,
         num_workers=num_workers,
         out_dir=tmp_out,
         cleanup_shards=True,
+        hist_len=hist_len,
     )
 
-    d_samples = list(zip(discard["x"], discard["mask"], discard["y"].tolist()))
-    c_samples = list(zip(call["x"], call["y"].tolist()))
-    r_samples = list(zip(riichi["x"], riichi["y"].tolist()))
-    return d_samples, c_samples, r_samples
-
-
-def build_toy_dataset(root_dir, years, max_files, max_samples):
-    d, _, _ = build_dataset(root_dir, years, max_files, max_samples, 0, 0, num_workers=1)
-    return d
+    d_samples = list(zip(
+        discard["x"],
+        discard["mask"],
+        discard["hist"],
+        discard["hist_mask"],
+        discard["y"].tolist(),
+    ))
+    c_samples = list(zip(
+        call["x"],
+        call["mask"],
+        call["hist"],
+        call["hist_mask"],
+        call["y"].tolist(),
+    ))
+    return d_samples, c_samples
 
 
 # ============================================================
@@ -638,7 +1015,6 @@ def save_processed_dataset(
     out_dir,
     discard_samples,
     call_samples,
-    riichi_samples,
     meta=None,
 ):
     out_dir = Path(out_dir)
@@ -646,11 +1022,9 @@ def save_processed_dataset(
 
     discard_data = pack_discard_samples(discard_samples)
     call_data = pack_call_samples(call_samples)
-    riichi_data = pack_riichi_samples(riichi_samples)
 
     torch.save(discard_data, out_dir / "discard.pt")
     torch.save(call_data, out_dir / "call.pt")
-    torch.save(riichi_data, out_dir / "riichi.pt")
 
     if meta is not None:
         torch.save(meta, out_dir / "meta.pt")
@@ -658,17 +1032,25 @@ def save_processed_dataset(
     print(f"Saved processed dataset to {out_dir}")
 
 
-def load_processed_dataset(data_dir):
+def load_processed_discard_dataset(data_dir):
     data_dir = Path(data_dir)
 
     discard = torch.load(data_dir / "discard.pt", weights_only=False)
-    call = torch.load(data_dir / "call.pt", weights_only=False)
-    riichi = torch.load(data_dir / "riichi.pt", weights_only=False)
 
     meta_path = data_dir / "meta.pt"
     meta = torch.load(meta_path, weights_only=False) if meta_path.exists() else None
 
-    return discard, call, riichi, meta
+    return discard, meta
+
+def load_processed_call_dataset(data_dir):
+    data_dir = Path(data_dir)
+
+    call = torch.load(data_dir / "call.pt", weights_only=False)
+
+    meta_path = data_dir / "meta.pt"
+    meta = torch.load(meta_path, weights_only=False) if meta_path.exists() else None
+
+    return call, meta
 
 
 # ============================================================
@@ -676,77 +1058,30 @@ def load_processed_dataset(data_dir):
 # ============================================================
 
 class MahjongDiscardDataset(Dataset):
-    def __init__(self, samples):
-        self.x = [s[0] for s in samples]
-        self.mask = [s[1] for s in samples]
-        self.y = [s[2] for s in samples]
-
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, idx):
-        return self.x[idx], self.mask[idx], self.y[idx]
-
-
-class MahjongCallDataset(Dataset):
-    def __init__(self, samples):
-        self.x = [s[0] for s in samples]
-        self.y = [s[1] for s in samples]
-
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, idx):
-        return self.x[idx], self.y[idx]
-
-
-class MahjongRiichiDataset(Dataset):
-    def __init__(self, samples):
-        self.x = [s[0] for s in samples]
-        self.y = [s[1] for s in samples]
-
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, idx):
-        return self.x[idx], self.y[idx]
-
-
-class PackedMahjongDiscardDataset(Dataset):
     def __init__(self, packed):
         self.x = packed["x"]
         self.mask = packed["mask"]
+        self.hist = packed["hist"]
+        self.hist_mask = packed["hist_mask"]
         self.y = packed["y"]
 
     def __len__(self):
         return self.y.shape[0]
 
     def __getitem__(self, idx):
-        return self.x[idx], self.mask[idx], self.y[idx]
+        return self.x[idx], self.mask[idx], self.hist[idx], self.hist_mask[idx], self.y[idx]
 
 
-class PackedMahjongCallDataset(Dataset):
+class MahjongCallDataset(Dataset):
     def __init__(self, packed):
         self.x = packed["x"]
+        self.mask = packed["mask"]
+        self.hist = packed["hist"]
+        self.hist_mask = packed["hist_mask"]
         self.y = packed["y"]
 
     def __len__(self):
         return self.y.shape[0]
 
     def __getitem__(self, idx):
-        return self.x[idx], self.y[idx]
-
-
-class PackedMahjongRiichiDataset(Dataset):
-    def __init__(self, packed):
-        self.x = packed["x"]
-        self.y = packed["y"]
-
-    def __len__(self):
-        return self.y.shape[0]
-
-    def __getitem__(self, idx):
-        return self.x[idx], self.y[idx]
-
-
-MahjongToyDataset = MahjongDiscardDataset
+        return self.x[idx], self.mask[idx], self.hist[idx], self.hist_mask[idx], self.y[idx]

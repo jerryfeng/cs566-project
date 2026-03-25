@@ -3,45 +3,47 @@ import sys
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 import pathlib
 
 try:
-    from .model import SmallMahjongResNet
-    from .gamestate import ToyRoundState, pai_to_idx, idx_to_pai
+    from .model import MahjongResNet
+    from .gamestate import RoundState, pai_to_idx, idx_to_pai
 except ImportError:
-    from model import SmallMahjongResNet
-    from gamestate import ToyRoundState, pai_to_idx, idx_to_pai
+    from model import MahjongResNet
+    from gamestate import RoundState, pai_to_idx, idx_to_pai
+
+
+CALL_CLASS_NAMES = ["pass", "chi", "pon", "hora", "dmk", "ank", "kak", "rii"]
+
+CALL_THRESHOLDS = {
+    1: 0.75,  # chi
+    2: 0.72,  # pon
+    4: 0.96,  # daiminkan
+    5: 0.92,  # ankan
+    6: 0.94,  # kakan
+}
 
 
 class Bot:
-    def __init__(self, model_path: str = "./best.pt", device: Optional[str] = None):
+    def __init__(self, device: Optional[str] = None):
         self.player_id: Optional[int] = None
-        self.model_path = model_path
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
-        self.round_state: Optional[ToyRoundState] = None
+        self.round_state: Optional[RoundState] = None
 
+    # ----------------------------------------------------------
+    # Model loading
+    # ----------------------------------------------------------
     def _load_model(self):
         if self.model is not None:
             return
 
-        model = SmallMahjongResNet(in_channels=16)
-        path = pathlib.Path(self.model_path)
-        if not path.exists():
-            path = pathlib.Path(__file__).parent / self.model_path
-        if not path.exists():
-            raise FileNotFoundError(f"Model not found: {self.model_path}")
+        model = MahjongResNet().to(self.device)
 
-        ckpt = torch.load(path, map_location=self.device, weights_only=True)
-        if isinstance(ckpt, dict) and "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-        elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-            state_dict = ckpt["model_state_dict"]
-        else:
-            state_dict = ckpt
+        model.discard_model.load_state_dict(torch.load("./best_discard.pt", map_location=self.device))
+        model.call_model.load_state_dict(torch.load("./best_call.pt", map_location=self.device))
 
-        model.load_state_dict(state_dict)
-        model.to(self.device)
         model.eval()
         self.model = model
 
@@ -51,44 +53,83 @@ class Bot:
             torch.cuda.empty_cache()
 
     # ----------------------------------------------------------
-    # Discard decision
+    # Tensor helpers
+    # ----------------------------------------------------------
+    def _get_state_tensors(self):
+        x = self.round_state.to_feature(self.player_id).unsqueeze(0).to(self.device)
+        hist, hist_mask = self.round_state.get_history(self.player_id)
+        hist = hist.unsqueeze(0).to(self.device)
+        hist_mask = hist_mask.unsqueeze(0).to(self.device)
+        return x, hist, hist_mask
+
+    @staticmethod
+    def _masked_prediction(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return logits.masked_fill(~mask, -1e9)
+
+    def _masked_call_prediction(self, logits: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
+        masked_logits = logits.clone()
+        masked_logits[~legal_mask] = -1e9
+
+        probs = F.softmax(masked_logits, dim=-1)
+
+        for action_idx, threshold in CALL_THRESHOLDS.items():
+            p = probs[:, action_idx]
+            reject = p < threshold
+            if reject.any():
+                probs[reject, action_idx] = 0.0
+
+        return probs
+
+    # ----------------------------------------------------------
+    # Forward helpers
+    # ----------------------------------------------------------
+    @torch.no_grad()
+    def _forward_discard(self, x, hist, hist_mask):
+        if hasattr(self.model, "forward_discard"):
+            out = self.model.forward_discard(x, hist, hist_mask)
+        elif hasattr(self.model, "discard_model"):
+            out = self.model.discard_model(x, hist, hist_mask)
+        else:
+            raise AttributeError("Model has neither forward_discard nor discard_model.")
+        return out[0] if isinstance(out, tuple) else out
+
+    @torch.no_grad()
+    def _forward_call(self, x, hist, hist_mask):
+        if hasattr(self.model, "forward_call"):
+            out = self.model.forward_call(x, hist, hist_mask)
+        elif hasattr(self.model, "call_model"):
+            out = self.model.call_model(x, hist, hist_mask)
+        else:
+            raise AttributeError("Model has neither forward_call nor call_model.")
+        return out[0] if isinstance(out, tuple) else out
+
+    # ----------------------------------------------------------
+    # Prediction helpers
     # ----------------------------------------------------------
     @torch.no_grad()
     def _predict_discard_idx(self) -> int:
-        x = self.round_state.to_feature(self.player_id)
-        x = x.unsqueeze(0).to(self.device)
-        logits = self.model.forward_discard(x)[0]
-        mask = x[0, 0] > 0
-        masked = logits.clone()
-        masked[~mask] = -1e30
+        x, hist, hist_mask = self._get_state_tensors()
+        logits = self._forward_discard(x, hist, hist_mask)[0]
+
+        hand_mask = self.round_state.legal_discard_mask(self.player_id)
+        masked = self._masked_prediction(logits, hand_mask)
         return int(torch.argmax(masked).item())
 
-    # ----------------------------------------------------------
-    # Call decision (pon / chi)
-    # ----------------------------------------------------------
     @torch.no_grad()
-    def _predict_call(self, called_tile_idx: int) -> int:
-        feat = self.round_state.to_feature(self.player_id)
-        called_plane = torch.zeros(1, 34, dtype=torch.float32)
-        called_plane[0, called_tile_idx] = 1.0
-        x = torch.cat([feat, called_plane], dim=0)
-        x = x.unsqueeze(0).to(self.device)
-        logits = self.model.forward_call(x)[0]
-        return int(torch.argmax(logits).item())
+    def _predict_call(self) -> int:
+        """
+        All call-like decisions come from forward_call:
+        pass / chi / pon / hora / dmk / ank / kak / rii
+        """
+        x, hist, hist_mask = self._get_state_tensors()
+        logits = self._forward_call(x, hist, hist_mask)
+
+        legal_mask = self.round_state.legal_call_mask_from_history(self.player_id)
+        probs = self._masked_call_prediction(logits, legal_mask)
+        return int(torch.argmax(probs, dim=1).item())
 
     # ----------------------------------------------------------
-    # Riichi decision
-    # ----------------------------------------------------------
-    @torch.no_grad()
-    def _predict_riichi(self) -> bool:
-        """Returns True if model recommends riichi."""
-        x = self.round_state.to_feature(self.player_id)
-        x = x.unsqueeze(0).to(self.device)
-        logits = self.model.forward_riichi(x)[0]  # [2]
-        return int(torch.argmax(logits).item()) == 1
-
-    # ----------------------------------------------------------
-    # Helper: can pon/chi
+    # Tile / meld helpers
     # ----------------------------------------------------------
     def _can_pon(self, tile_idx: int) -> bool:
         return self.round_state.hand_counts(self.player_id)[tile_idx] >= 2
@@ -98,12 +139,14 @@ class Bot:
             return False
         if tile_idx >= 27:
             return False
+
         hand_cnts = self.round_state.hand_counts(self.player_id)
         suit_start = (tile_idx // 9) * 9
         pos = tile_idx - suit_start
+
         if pos >= 2 and hand_cnts[suit_start + pos - 2] > 0 and hand_cnts[suit_start + pos - 1] > 0:
             return True
-        if pos >= 1 and pos <= 7 and hand_cnts[suit_start + pos - 1] > 0 and hand_cnts[suit_start + pos + 1] > 0:
+        if 1 <= pos <= 7 and hand_cnts[suit_start + pos - 1] > 0 and hand_cnts[suit_start + pos + 1] > 0:
             return True
         if pos <= 6 and hand_cnts[suit_start + pos + 1] > 0 and hand_cnts[suit_start + pos + 2] > 0:
             return True
@@ -112,16 +155,19 @@ class Bot:
     def _find_chi_consumed(self, tile_idx: int):
         if tile_idx >= 27:
             return None
+
         hand_cnts = self.round_state.hand_counts(self.player_id)
         suit_start = (tile_idx // 9) * 9
         pos = tile_idx - suit_start
         sequences = []
+
         if pos >= 2:
             sequences.append((suit_start + pos - 2, suit_start + pos - 1))
-        if pos >= 1 and pos <= 7:
+        if 1 <= pos <= 7:
             sequences.append((suit_start + pos - 1, suit_start + pos + 1))
         if pos <= 6:
             sequences.append((suit_start + pos + 1, suit_start + pos + 2))
+
         for a, b in sequences:
             if hand_cnts[a] > 0 and hand_cnts[b] > 0:
                 return [idx_to_pai(a), idx_to_pai(b)]
@@ -136,60 +182,73 @@ class Bot:
                     break
         return found if len(found) == 2 else None
 
+    # Optional kan helpers if your RoundState exposes them.
+    def _find_daiminkan_consumed(self, tile_idx: int):
+        found = []
+        for pai in self.round_state.hands[self.player_id]:
+            if pai_to_idx(pai) == tile_idx:
+                found.append(pai)
+                if len(found) == 3:
+                    break
+        return found if len(found) == 3 else None
+
+    def _find_ankan_consumed(self):
+        hand = self.round_state.hands[self.player_id]
+        counts = self.round_state.hand_counts(self.player_id)
+        for tile_idx in range(34):
+            if counts[tile_idx] >= 4:
+                found = []
+                for pai in hand:
+                    if pai_to_idx(pai) == tile_idx:
+                        found.append(pai)
+                        if len(found) == 4:
+                            return found
+        return None
+
+    def _find_kakan_pai(self):
+        if not hasattr(self.round_state, "melds"):
+            return None
+
+        hand = self.round_state.hands[self.player_id]
+        counts = self.round_state.hand_counts(self.player_id)
+        player_melds = self.round_state.melds[self.player_id]
+
+        for meld in player_melds:
+            # Try to infer pon meld structure conservatively.
+            meld_pais = meld.get("pais") or meld.get("consumed") or []
+            if len(meld_pais) < 3:
+                continue
+
+            tile_idx = pai_to_idx(meld_pais[0])
+            if any(pai_to_idx(p) != tile_idx for p in meld_pais[:3]):
+                continue
+
+            if counts[tile_idx] > 0:
+                for pai in hand:
+                    if pai_to_idx(pai) == tile_idx:
+                        return pai
+        return None
+
     # ----------------------------------------------------------
-    # Main decision logic
+    # Action construction from call class
     # ----------------------------------------------------------
-    def _maybe_act(self, last_event: dict) -> Optional[dict]:
-        etype = last_event["type"]
+    def _build_action_from_call_decision(self, decision: int, trigger_event: dict) -> Optional[dict]:
         rs = self.round_state
+        etype = trigger_event["type"]
 
-        # === OWN TSUMO: check win -> riichi -> discard ===
-        if etype in {"tsumo", "chi", "pon"} and last_event["actor"] == self.player_id:
+        # 0 = pass
+        if decision == 0:
+            return None
 
-            # 1. Tsumo agari (self-draw win) — rule-based, always declare
-            if etype == "tsumo" and rs.check_tsumo_agari(self.player_id):
-                return {
-                    "type": "hora",
-                    "actor": self.player_id,
-                    "target": self.player_id,
-                    "pai": last_event["pai"],
-                }
-
-            # 2. Riichi — model-based decision
-            if etype == "tsumo" and rs.can_riichi(self.player_id):
-                if self._predict_riichi():
-                    # find a valid riichi discard (must leave hand in tenpai)
-                    riichi_discards = rs.find_riichi_discards(self.player_id)
-                    if riichi_discards:
-                        # use model to pick best discard among valid riichi discards
-                        idx = self._predict_discard_idx()
-                        if idx not in riichi_discards:
-                            idx = riichi_discards[0]  # fallback to first valid
-                        pai = rs.choose_discard_tile(self.player_id, idx)
-                        return {
-                            "type": "reach",
-                            "actor": self.player_id,
-                            "pai": pai,
-                        }
-
-            # 3. Normal discard
-            idx = self._predict_discard_idx()
-            pai = rs.choose_discard_tile(self.player_id, idx)
-            return {
-                "type": "dahai",
-                "actor": self.player_id,
-                "pai": pai,
-                "tsumogiri": (etype == "tsumo" and rs.last_draw[self.player_id] == pai),
-            }
-
-        # === OPPONENT DISCARD: check ron -> pon/chi ===
-        if etype == "dahai" and last_event["actor"] != self.player_id:
-            discarder = last_event["actor"]
-            pai = last_event["pai"]
+        # ------------------------------------------------------
+        # Opponent discard window
+        # ------------------------------------------------------
+        if etype == "dahai" and trigger_event["actor"] != self.player_id:
+            discarder = trigger_event["actor"]
+            pai = trigger_event["pai"]
             tile_idx = pai_to_idx(pai)
 
-            # 1. Ron — rule-based, always declare
-            if rs.check_ron(self.player_id, pai):
+            if decision == 3:
                 return {
                     "type": "hora",
                     "actor": self.player_id,
@@ -197,18 +256,9 @@ class Bot:
                     "pai": pai,
                 }
 
-            # 2. Pon / Chi — model-based
-            can_p = self._can_pon(tile_idx)
-            can_c = self._can_chi(tile_idx, discarder)
-
-            if not can_p and not can_c:
-                return None
-
-            decision = self._predict_call(tile_idx)
-
-            if decision == 1 and can_p:
+            if decision == 2:
                 consumed = self._find_pon_consumed(tile_idx)
-                if consumed:
+                if consumed is not None:
                     return {
                         "type": "pon",
                         "actor": self.player_id,
@@ -216,10 +266,11 @@ class Bot:
                         "pai": pai,
                         "consumed": consumed,
                     }
+                return None
 
-            elif decision == 2 and can_c:
+            if decision == 1:
                 consumed = self._find_chi_consumed(tile_idx)
-                if consumed:
+                if consumed is not None:
                     return {
                         "type": "chi",
                         "actor": self.player_id,
@@ -227,11 +278,128 @@ class Bot:
                         "pai": pai,
                         "consumed": consumed,
                     }
+                return None
+
+            if decision == 4:
+                consumed = self._find_daiminkan_consumed(tile_idx)
+                if consumed is not None:
+                    return {
+                        "type": "daiminkan",
+                        "actor": self.player_id,
+                        "target": discarder,
+                        "pai": pai,
+                        "consumed": consumed,
+                    }
+                return None
+
+            return None
+
+        # ------------------------------------------------------
+        # Own tsumo window
+        # ------------------------------------------------------
+        if etype == "tsumo" and trigger_event["actor"] == self.player_id:
+            pai = trigger_event["pai"]
+
+            if decision == 3:
+                return {
+                    "type": "hora",
+                    "actor": self.player_id,
+                    "target": self.player_id,
+                    "pai": pai,
+                }
+
+            if decision == 7:
+                riichi_discards = rs.find_riichi_discards(self.player_id)
+                if not riichi_discards:
+                    return None
+
+                idx = self._predict_discard_idx()
+                if idx not in riichi_discards:
+                    idx = riichi_discards[0]
+
+                discard_pai = rs.choose_discard_tile(self.player_id, idx)
+                return {
+                    "type": "reach",
+                    "actor": self.player_id,
+                    "pai": discard_pai,
+                }
+
+            if decision == 5:
+                consumed = self._find_ankan_consumed()
+                if consumed is not None:
+                    return {
+                        "type": "ankan",
+                        "actor": self.player_id,
+                        "consumed": consumed,
+                    }
+                return None
+
+            if decision == 6:
+                pai_to_add = self._find_kakan_pai()
+                if pai_to_add is not None:
+                    return {
+                        "type": "kakan",
+                        "actor": self.player_id,
+                        "pai": pai_to_add,
+                    }
+                return None
 
             return None
 
         return None
 
+    # ----------------------------------------------------------
+    # Main decision logic
+    # ----------------------------------------------------------
+    def _maybe_act(self, last_event: dict) -> Optional[dict]:
+        etype = last_event["type"]
+        rs = self.round_state
+
+        # ------------------------------------------------------
+        # Opponent discard: ONLY use forward_call
+        # ------------------------------------------------------
+        if etype == "dahai" and last_event["actor"] != self.player_id:
+            decision = self._predict_call()
+            return self._build_action_from_call_decision(decision, last_event)
+
+        # ------------------------------------------------------
+        # Own tsumo: first ask forward_call for hora/riichi/kan/pass
+        # then discard if call-head says pass
+        # ------------------------------------------------------
+        if etype == "tsumo" and last_event["actor"] == self.player_id:
+            decision = self._predict_call()
+            action = self._build_action_from_call_decision(decision, last_event)
+            if action is not None:
+                return action
+
+            idx = self._predict_discard_idx()
+            pai = rs.choose_discard_tile(self.player_id, idx)
+            return {
+                "type": "dahai",
+                "actor": self.player_id,
+                "pai": pai,
+                "tsumogiri": (rs.last_draw[self.player_id] == pai),
+            }
+
+        # ------------------------------------------------------
+        # After our chi / pon, just discard
+        # No dedicated riichi/hora forward here.
+        # ------------------------------------------------------
+        if etype in {"chi", "pon"} and last_event["actor"] == self.player_id:
+            idx = self._predict_discard_idx()
+            pai = rs.choose_discard_tile(self.player_id, idx)
+            return {
+                "type": "dahai",
+                "actor": self.player_id,
+                "pai": pai,
+                "tsumogiri": False,
+            }
+
+        return None
+
+    # ----------------------------------------------------------
+    # Public API
+    # ----------------------------------------------------------
     def react(self, events: str) -> str:
         try:
             payload = json.loads(events)
@@ -252,7 +420,7 @@ class Bot:
 
             if t == "start_game":
                 self.player_id = e["id"]
-                self.round_state = ToyRoundState()
+                self.round_state = RoundState()
                 self._load_model()
                 return_action = {"type": "none"}
                 continue
@@ -266,7 +434,7 @@ class Bot:
             if self.player_id is None or self.round_state is None:
                 continue
 
-            # opponent discard: check ron / call BEFORE applying event
+            # Opponent discard: react before applying event.
             if t == "dahai" and e["actor"] != self.player_id:
                 maybe = self._maybe_act(e)
                 if maybe is not None:
@@ -274,7 +442,7 @@ class Bot:
 
             self.round_state.apply_event(e)
 
-            # own tsumo / chi / pon: check win / riichi / discard AFTER applying event
+            # Own tsumo / chi / pon: react after applying event.
             if t in {"tsumo", "chi", "pon"} and e.get("actor") == self.player_id:
                 maybe = self._maybe_act(e)
                 if maybe is not None:
@@ -286,8 +454,7 @@ class Bot:
 
 
 def main():
-    model_path = sys.argv[1] if len(sys.argv) >= 2 else "checkpoints/best.pt"
-    bot = Bot(model_path=model_path)
+    bot = Bot()
 
     for line in sys.stdin:
         line = line.strip()
@@ -303,3 +470,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
