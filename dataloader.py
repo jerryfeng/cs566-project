@@ -3,41 +3,43 @@ import torch
 import gzip
 import random
 import json
+import copy
+import math
+import tempfile
+import numpy as np
 from torch.utils.data import Dataset
 from multiprocessing import Pool
 
-from gamestate import RoundState, pai_to_idx
-
-# ============================================================
-# Config
-# ============================================================
+from gamestate import (
+    RoundState,
+    pai_to_idx,
+    idx_to_pai,
+    NUM_TILES,
+    NUM_CALL_KINDS,
+    NUM_TSUMO_ACTIONS,
+    CALL_KIND_TO_IDX,
+    TSUMO_ACTION_TO_IDX,
+)
 
 DEFAULT_HIST_LEN = 64
+IGNORE_INDEX = -100
 
-# ============================================================
-# Action space for merged "call" dataset
-# ============================================================
+DAHAI_ACTION_NAMES = {
+    CALL_KIND_TO_IDX["none"]: "none",
+    CALL_KIND_TO_IDX["chi_low"]: "chi_low",
+    CALL_KIND_TO_IDX["chi_mid"]: "chi_mid",
+    CALL_KIND_TO_IDX["chi_high"]: "chi_high",
+    CALL_KIND_TO_IDX["pon"]: "pon",
+    CALL_KIND_TO_IDX["kan"]: "kan",
+    CALL_KIND_TO_IDX["hora"]: "hora",
+}
 
-CALL_PASS = 0
-CALL_CHI = 1
-CALL_PON = 2
-CALL_HORA = 3
-CALL_DAIMINKAN = 4
-CALL_ANKAN = 5
-CALL_KAKAN = 6
-CALL_RIICHI = 7
-
-NUM_CALL_ACTIONS = 8
-
-CALL_ACTION_NAMES = {
-    CALL_PASS: "none",
-    CALL_CHI: "chi",
-    CALL_PON: "pon",
-    CALL_HORA: "hora",
-    CALL_DAIMINKAN: "daiminkan",
-    CALL_ANKAN: "ankan",
-    CALL_KAKAN: "kakan",
-    CALL_RIICHI: "riichi",
+TSUMO_ACTION_NAMES = {
+    TSUMO_ACTION_TO_IDX["none"]: "none",
+    TSUMO_ACTION_TO_IDX["dahai"]: "dahai",
+    TSUMO_ACTION_TO_IDX["reach"]: "reach",
+    TSUMO_ACTION_TO_IDX["kan"]: "kan",
+    TSUMO_ACTION_TO_IDX["hora"]: "hora",
 }
 
 
@@ -46,177 +48,143 @@ def open_mjson(path):
         magic = f.read(2)
     if magic == b"\x1f\x8b":
         return gzip.open(path, "rt", encoding="utf-8")
-    else:
-        return open(path, "r", encoding="utf-8")
+    return open(path, "r", encoding="utf-8")
 
 
-# ============================================================
-# Call legality helpers
-# ============================================================
-
-def _can_pon(hand_counts, tile_idx):
-    return hand_counts[tile_idx] >= 2
-
-
-def _can_daiminkan(hand_counts, tile_idx):
-    return hand_counts[tile_idx] >= 3
-
-
-def _can_chi(hand_counts, tile_idx):
-    if tile_idx >= 27:
-        return False
-    suit_start = (tile_idx // 9) * 9
-    pos = tile_idx - suit_start
-    if pos >= 2 and hand_counts[suit_start + pos - 2] > 0 and hand_counts[suit_start + pos - 1] > 0:
-        return True
-    if pos >= 1 and pos <= 7 and hand_counts[suit_start + pos - 1] > 0 and hand_counts[suit_start + pos + 1] > 0:
-        return True
-    if pos <= 6 and hand_counts[suit_start + pos + 1] > 0 and hand_counts[suit_start + pos + 2] > 0:
-        return True
-    return False
-
-
-def _can_ankan(state: RoundState, actor: int) -> bool:
-    hand_counts = state.hand_counts(actor)
-    return any(c >= 4 for c in hand_counts)
-
-
-def _can_kakan(state: RoundState, actor: int) -> bool:
-    # Approximation based on current state representation:
-    # if player has 1 in hand and already has 3 copies exposed in meld tiles,
-    # we treat it as a possible kakan.
-    hand_counts = state.hand_counts(actor)
-    meld_counts = state.melds[actor]
-    for i in range(34):
-        if hand_counts[i] >= 1 and meld_counts[i] == 3:
-            return True
-    return False
-
-
-# ============================================================
-# Feature builders
-# ============================================================
-
-def _make_call_feature(state, actor, called_tile_idx=None):
+def _make_feature(state: RoundState, actor: int):
     feat = state.to_feature(actor)
-    called_plane = torch.zeros(1, 34, dtype=torch.float32)
-    if called_tile_idx is not None:
-        called_plane[0, called_tile_idx] = 1.0
-    return torch.cat([feat, called_plane], dim=0)
+    hist, hist_mask = state.get_history(observer=actor, max_len=DEFAULT_HIST_LEN)
+    return feat, hist, hist_mask
 
 
-def _make_discard_feature_and_mask(state, actor):
-    feat = state.to_feature(actor)
-    mask = state.legal_discard_mask(actor)
-    return feat, mask
-
-
-def _make_discard_sample(state, actor, feat, discard_mask, label, hist_len=DEFAULT_HIST_LEN):
-    hist, hist_mask = state.get_history(observer=actor, max_len=hist_len)
-    return feat, discard_mask.clone(), hist, hist_mask, int(label)
-
-
-def _make_call_sample(state, actor, action_mask, label, called_tile_idx=None, hist_len=DEFAULT_HIST_LEN):
-    feat = _make_call_feature(state, actor, called_tile_idx)
-    hist, hist_mask = state.get_history(observer=actor, max_len=hist_len)
+def _make_dahai_sample(state: RoundState, actor: int, action_mask: torch.Tensor, label: int):
+    feat, hist, hist_mask = _make_feature(state, actor)
     return feat, action_mask.clone(), hist, hist_mask, int(label)
 
 
-def _build_discard_reaction_mask(state: RoundState, player: int, discarder: int, pai: str, pai_idx: int):
-    hand_counts = state.hand_counts(player)
-    mask = torch.zeros(NUM_CALL_ACTIONS, dtype=torch.bool)
-
-    can_hora = state.check_ron(player, pai)
-    can_pon = _can_pon(hand_counts, pai_idx)
-    can_daiminkan = _can_daiminkan(hand_counts, pai_idx)
-    can_chi = (player == (discarder + 1) % 4) and _can_chi(hand_counts, pai_idx)
-
-    mask[CALL_CHI] = can_chi
-    mask[CALL_PON] = can_pon
-    mask[CALL_HORA] = can_hora
-    mask[CALL_DAIMINKAN] = can_daiminkan
-
-    if mask.any():
-        mask[CALL_PASS] = True
-
-    return mask
-
-
-def _build_self_action_mask(state: RoundState, actor: int):
-    mask = torch.zeros(NUM_CALL_ACTIONS, dtype=torch.bool)
-
-    mask[CALL_HORA] = state.check_tsumo_agari(actor)
-    mask[CALL_ANKAN] = _can_ankan(state, actor)
-    mask[CALL_KAKAN] = _can_kakan(state, actor)
-    mask[CALL_RIICHI] = state.can_riichi(actor)
-
-    if mask.any():
-        mask[CALL_PASS] = True
-
-    return mask
+def _make_tsumo_sample(
+    state: RoundState,
+    actor: int,
+    action_mask: torch.Tensor,
+    tile_mask: torch.Tensor,
+    action_label: int,
+    tile_label: int,
+):
+    feat, hist, hist_mask = _make_feature(state, actor)
+    return (
+        feat,
+        action_mask.clone(),
+        tile_mask.clone(),
+        hist,
+        hist_mask,
+        int(action_label),
+        int(tile_label),
+    )
 
 
-# ============================================================
-# Main extraction
-# ============================================================
+def _tile_mask_for_action(masks: dict, action_label: int) -> torch.Tensor:
+    if action_label == TSUMO_ACTION_TO_IDX["dahai"]:
+        return masks["discard_mask"].clone()
+    if action_label == TSUMO_ACTION_TO_IDX["reach"]:
+        return masks["reach_mask"].clone()
+    if action_label == TSUMO_ACTION_TO_IDX["kan"]:
+        return masks["kan_mask"].clone()
+    return torch.zeros(NUM_TILES, dtype=torch.bool)
 
-def extract_all_from_file(path, max_d=500, max_c=300, max_pass_per_opp=1, hist_len=DEFAULT_HIST_LEN):
-    """
-    Returns:
-      d_samples: list[(feat, discard_mask, hist, hist_mask, discard_label)]
-      c_samples: list[(feat, call_action_mask, hist, hist_mask, call_label)]
-    """
-    d_samples = []
-    c_samples = []
+
+def _resolve_tsumo_action_from_event(state: RoundState, event: dict, pending: dict):
+    actor = pending["actor"]
+    etype = event["type"]
+    masks = pending["masks"]
+
+    if etype == "hora" and event.get("actor") == actor:
+        return TSUMO_ACTION_TO_IDX["hora"], IGNORE_INDEX, _tile_mask_for_action(masks, TSUMO_ACTION_TO_IDX["hora"])
+
+    if etype == "ankan" and event.get("actor") == actor:
+        consumed = event.get("consumed", [])
+        tile = pai_to_idx(consumed[0]) if consumed else IGNORE_INDEX
+        return TSUMO_ACTION_TO_IDX["kan"], tile, _tile_mask_for_action(masks, TSUMO_ACTION_TO_IDX["kan"])
+
+    if etype == "kakan" and event.get("actor") == actor:
+        pai = event.get("pai")
+        tile = pai_to_idx(pai) if pai is not None else IGNORE_INDEX
+        return TSUMO_ACTION_TO_IDX["kan"], tile, _tile_mask_for_action(masks, TSUMO_ACTION_TO_IDX["kan"])
+
+    if etype == "reach" and event.get("actor") == actor:
+        pending["saw_reach"] = True
+        return None
+
+    if etype == "dahai" and event.get("actor") == actor:
+        pai = event.get("pai")
+        tile = pai_to_idx(pai) if pai is not None else IGNORE_INDEX
+        if pending.get("saw_reach", False):
+            return TSUMO_ACTION_TO_IDX["reach"], tile, _tile_mask_for_action(masks, TSUMO_ACTION_TO_IDX["reach"])
+        return TSUMO_ACTION_TO_IDX["dahai"], tile, _tile_mask_for_action(masks, TSUMO_ACTION_TO_IDX["dahai"])
+
+    return None
+
+
+def extract_all_from_file(
+    path,
+    max_dahai_samples=500,
+    max_tsumo_samples=500,
+    hist_len=DEFAULT_HIST_LEN,
+):
+    dahai_samples = []
+    tsumo_samples = []
 
     state = RoundState()
-    discard_pending = None
+    pending_dahai = None
+    pending_tsumo = None
 
-    call_pending_dahai = None
-    pending_self_action = None
+    # Per-file worker tasks pass 0 when that branch should collect nothing.
+    # Negative values are treated as uncapped; positive values are capped.
+    def dahai_enabled():
+        return max_dahai_samples != 0
 
-    def _d_full():
-        return max_d <= 0 or len(d_samples) >= max_d
+    def tsumo_enabled():
+        return max_tsumo_samples != 0
 
-    def _c_full():
-        return max_c <= 0 or len(c_samples) >= max_c
+    def dahai_full():
+        return max_dahai_samples > 0 and len(dahai_samples) >= max_dahai_samples
 
-    def _flush_pending_discard_reactions():
-        nonlocal call_pending_dahai
-        if call_pending_dahai is None or _c_full():
-            call_pending_dahai = None
+    def tsumo_full():
+        return max_tsumo_samples > 0 and len(tsumo_samples) >= max_tsumo_samples
+
+    def can_collect_dahai():
+        return dahai_enabled() and not dahai_full()
+
+    def can_collect_tsumo():
+        return tsumo_enabled() and not tsumo_full()
+
+    def flush_pending_dahai_as_pass():
+        nonlocal pending_dahai
+        if pending_dahai is None or not can_collect_dahai():
+            pending_dahai = None
             return
-
-        _add_discard_pass_samples(
-            state=state,
-            pending_dahai=call_pending_dahai,
-            samples=c_samples,
-            max_pass=max_pass_per_opp,
-            hist_len=hist_len,
-        )
-        call_pending_dahai = None
-
-    def _flush_pending_self_action_as_pass():
-        nonlocal pending_self_action
-        if pending_self_action is None or _c_full():
-            pending_self_action = None
-            return
-
-        actor = pending_self_action["actor"]
-        mask = pending_self_action["mask"]
-        if mask[CALL_PASS]:
-            c_samples.append(
-                _make_call_sample(
-                    state, actor, mask, CALL_PASS,
-                    called_tile_idx=None,
-                    hist_len=hist_len,
+        for actor, payload in pending_dahai["by_actor"].items():
+            if not can_collect_dahai():
+                break
+            if payload["resolved"]:
+                continue
+            dahai_samples.append(
+                _make_dahai_sample(
+                    state=payload["snapshot_state"],
+                    actor=actor,
+                    action_mask=payload["mask"],
+                    label=CALL_KIND_TO_IDX["none"],
                 )
             )
-        pending_self_action = None
+            payload["resolved"] = True
+        pending_dahai = None
+
+    def flush_pending_tsumo_skip():
+        nonlocal pending_tsumo
+        pending_tsumo = None
 
     with open_mjson(path) as f:
         for line in f:
-            if _d_full() and _c_full():
+            if dahai_full() and tsumo_full():
                 break
 
             line = line.strip()
@@ -230,362 +198,115 @@ def extract_all_from_file(path, max_d=500, max_c=300, max_pass_per_opp=1, hist_l
 
             etype = event.get("type")
 
-            # ---------------------------------------------------
-            # start_kyoku
-            # ---------------------------------------------------
             if etype == "start_kyoku":
-                _flush_pending_discard_reactions()
-                _flush_pending_self_action_as_pass()
-
-                discard_pending = None
-                call_pending_dahai = None
-                pending_self_action = None
+                flush_pending_dahai_as_pass()
+                flush_pending_tsumo_skip()
                 state.apply_event(event)
                 continue
 
-            # ---------------------------------------------------
-            # tsumo
-            # ---------------------------------------------------
-            if etype == "tsumo":
-                actor = event.get("actor")
-
-                _flush_pending_discard_reactions()
-                _flush_pending_self_action_as_pass()
-
-                state.apply_event(event)
-
-                if actor is not None and not _d_full():
-                    feat, mask = _make_discard_feature_and_mask(state, actor)
-                    discard_pending = (actor, feat, mask)
-                else:
-                    discard_pending = None
-
-                pending_self_action = None
-                if actor is not None and not _c_full():
-                    self_mask = _build_self_action_mask(state, actor)
-                    if self_mask.any():
-                        pending_self_action = {
-                            "actor": actor,
-                            "mask": self_mask,
-                        }
-                continue
-
-            # ---------------------------------------------------
-            # reach -> merged into call actions
-            # ---------------------------------------------------
-            if etype == "reach":
-                actor = event.get("actor")
-
-                if pending_self_action is not None and actor == pending_self_action["actor"] and not _c_full():
-                    mask = pending_self_action["mask"]
-                    if mask[CALL_RIICHI]:
-                        c_samples.append(
-                            _make_call_sample(
-                                state, actor, mask, CALL_RIICHI,
-                                called_tile_idx=None,
-                                hist_len=hist_len,
-                            )
-                        )
-                    elif mask[CALL_PASS]:
-                        c_samples.append(
-                            _make_call_sample(
-                                state, actor, mask, CALL_PASS,
-                                called_tile_idx=None,
-                                hist_len=hist_len,
-                            )
-                        )
-
-                pending_self_action = None
-                discard_pending = None
-                state.apply_event(event)
-                continue
-
-            # ---------------------------------------------------
-            # dahai
-            # ---------------------------------------------------
-            if etype == "dahai":
-                actor = event.get("actor")
-                pai = event.get("pai")
-
-                if pending_self_action is not None and actor == pending_self_action["actor"] and not _c_full():
-                    mask = pending_self_action["mask"]
-                    if mask[CALL_PASS]:
-                        c_samples.append(
-                            _make_call_sample(
-                                state, actor, mask, CALL_PASS,
-                                called_tile_idx=None,
-                                hist_len=hist_len,
-                            )
-                        )
-                    pending_self_action = None
-                else:
-                    _flush_pending_self_action_as_pass()
-
-                if discard_pending is not None and not _d_full():
-                    p_actor, feat, mask = discard_pending
-                    if actor == p_actor and pai is not None:
-                        label = pai_to_idx(pai)
-                        if mask[label]:
-                            d_samples.append(
-                                _make_discard_sample(
-                                    state, actor, feat, mask, label,
-                                    hist_len=hist_len,
+            # Resolve pending reaction labels before state mutation if needed
+            if pending_dahai is not None and etype in {"chi", "pon", "daiminkan", "hora", "tsumo", "end_kyoku", "ryukyoku"}:
+                if etype in {"chi", "pon", "daiminkan"}:
+                    actor = event.get("actor")
+                    if actor in pending_dahai["by_actor"]:
+                        payload = pending_dahai["by_actor"][actor]
+                        if not payload["resolved"] and can_collect_dahai():
+                            action_mask = payload["mask"]
+                            if etype == "chi":
+                                label_name = RoundState.classify_chi_from_event(event)
+                            elif etype == "pon":
+                                label_name = "pon"
+                            else:
+                                label_name = "kan"
+                            if action_mask[CALL_KIND_TO_IDX[label_name]]:
+                                dahai_samples.append(
+                                    _make_dahai_sample(
+                                        state=payload["snapshot_state"],
+                                        actor=actor,
+                                        action_mask=action_mask,
+                                        label=CALL_KIND_TO_IDX[label_name],
+                                    )
+                                )
+                            payload["resolved"] = True
+                    flush_pending_dahai_as_pass()
+                elif etype == "hora":
+                    actor = event.get("actor")
+                    if actor in pending_dahai["by_actor"]:
+                        payload = pending_dahai["by_actor"][actor]
+                        action_mask = payload["mask"]
+                        if not payload["resolved"] and can_collect_dahai() and action_mask[CALL_KIND_TO_IDX["hora"]]:
+                            dahai_samples.append(
+                                _make_dahai_sample(
+                                    state=payload["snapshot_state"],
+                                    actor=actor,
+                                    action_mask=action_mask,
+                                    label=CALL_KIND_TO_IDX["hora"],
                                 )
                             )
-                        else:
-                            raise ValueError(
-                                f"Discard label {pai} / idx={label} not in mask for actor={actor} "
-                                f"while processing {path}"
-                            )
-                discard_pending = None
-
-                _flush_pending_discard_reactions()
-
-                state.apply_event(event)
-
-                if actor is not None and pai is not None and not _c_full():
-                    call_pending_dahai = {
-                        "actor": actor,
-                        "pai": pai,
-                        "pai_idx": pai_to_idx(pai),
-                        "resolved": set(),
-                    }
+                            payload["resolved"] = True
+                    # multiple ron support: do not flush immediately here; if another hora follows it can still resolve
+                    # flush on next non-hora or end of kyoku
                 else:
-                    call_pending_dahai = None
-                continue
+                    flush_pending_dahai_as_pass()
 
-            # ---------------------------------------------------
-            # chi / pon / daiminkan from another player's discard
-            # ---------------------------------------------------
-            if etype in {"chi", "pon", "daiminkan"}:
-                actor = event.get("actor")
-
-                if call_pending_dahai is not None and actor is not None and not _c_full():
-                    discarder = call_pending_dahai["actor"]
-                    pai = call_pending_dahai["pai"]
-                    pai_idx = call_pending_dahai["pai_idx"]
-
-                    mask = _build_discard_reaction_mask(state, actor, discarder, pai, pai_idx)
-
-                    label = {
-                        "chi": CALL_CHI,
-                        "pon": CALL_PON,
-                        "daiminkan": CALL_DAIMINKAN,
-                    }[etype]
-
-                    if mask[label]:
-                        c_samples.append(
-                            _make_call_sample(
-                                state, actor, mask, label,
-                                called_tile_idx=pai_idx,
-                                hist_len=hist_len,
+            if pending_tsumo is not None:
+                resolved = _resolve_tsumo_action_from_event(state, event, pending_tsumo)
+                if resolved is not None:
+                    if can_collect_tsumo():
+                        action_label, tile_label, tile_mask = resolved
+                        action_mask = pending_tsumo["masks"]["action_mask"]
+                        if action_mask[action_label] and (tile_label == IGNORE_INDEX or tile_mask[tile_label]):
+                            tsumo_samples.append(
+                                _make_tsumo_sample(
+                                    state=pending_tsumo["snapshot_state"],
+                                    actor=pending_tsumo["actor"],
+                                    action_mask=action_mask,
+                                    tile_mask=tile_mask,
+                                    action_label=action_label,
+                                    tile_label=tile_label,
+                                )
                             )
-                        )
-                        call_pending_dahai["resolved"].add(actor)
+                    pending_tsumo = None
+                elif etype in {"tsumo", "start_kyoku", "end_kyoku", "ryukyoku"} and pending_tsumo is not None:
+                    flush_pending_tsumo_skip()
 
-                    _add_discard_pass_samples(
-                        state=state,
-                        pending_dahai=call_pending_dahai,
-                        samples=c_samples,
-                        max_pass=max_pass_per_opp,
-                        hist_len=hist_len,
-                    )
-
-                call_pending_dahai = None
-                discard_pending = None
-                pending_self_action = None
-
-                state.apply_event(event)
-
-                if etype in {"chi", "pon"} and actor is not None and not _d_full():
-                    feat, mask = _make_discard_feature_and_mask(state, actor)
-                    discard_pending = (actor, feat, mask)
-
-                continue
-
-            # ---------------------------------------------------
-            # ankan / kakan from self draw
-            # ---------------------------------------------------
-            if etype in {"ankan", "kakan"}:
-                actor = event.get("actor")
-
-                if pending_self_action is not None and actor == pending_self_action["actor"] and not _c_full():
-                    mask = pending_self_action["mask"]
-                    label = CALL_ANKAN if etype == "ankan" else CALL_KAKAN
-                    if mask[label]:
-                        c_samples.append(
-                            _make_call_sample(
-                                state, actor, mask, label,
-                                called_tile_idx=None,
-                                hist_len=hist_len,
-                            )
-                        )
-                    elif mask[CALL_PASS]:
-                        c_samples.append(
-                            _make_call_sample(
-                                state, actor, mask, CALL_PASS,
-                                called_tile_idx=None,
-                                hist_len=hist_len,
-                            )
-                        )
-
-                pending_self_action = None
-                discard_pending = None
-
-                state.apply_event(event)
-                continue
-
-            # ---------------------------------------------------
-            # hora: either ron on a discard, or tsumo on self draw
-            # ---------------------------------------------------
-            if etype == "hora":
-                actor = event.get("actor")
-
-                handled = False
-
-                if (
-                    call_pending_dahai is not None
-                    and actor is not None
-                    and actor != call_pending_dahai["actor"]
-                    and not _c_full()
-                ):
-                    discarder = call_pending_dahai["actor"]
-                    pai = call_pending_dahai["pai"]
-                    pai_idx = call_pending_dahai["pai_idx"]
-
-                    mask = _build_discard_reaction_mask(state, actor, discarder, pai, pai_idx)
-                    if mask[CALL_HORA]:
-                        c_samples.append(
-                            _make_call_sample(
-                                state, actor, mask, CALL_HORA,
-                                called_tile_idx=pai_idx,
-                                hist_len=hist_len,
-                            )
-                        )
-                        call_pending_dahai["resolved"].add(actor)
-                        handled = True
-
-                if (
-                    not handled
-                    and pending_self_action is not None
-                    and actor is not None
-                    and actor == pending_self_action["actor"]
-                    and not _c_full()
-                ):
-                    mask = pending_self_action["mask"]
-                    if mask[CALL_HORA]:
-                        c_samples.append(
-                            _make_call_sample(
-                                state, actor, mask, CALL_HORA,
-                                called_tile_idx=None,
-                                hist_len=hist_len,
-                            )
-                        )
-                    elif mask[CALL_PASS]:
-                        c_samples.append(
-                            _make_call_sample(
-                                state, actor, mask, CALL_PASS,
-                                called_tile_idx=None,
-                                hist_len=hist_len,
-                            )
-                        )
-                    pending_self_action = None
-                    discard_pending = None
-                    handled = True
-
-                if (
-                    not handled
-                    and pending_self_action is not None
-                    and actor is not None
-                    and actor == pending_self_action["actor"]
-                    and not _c_full()
-                ):
-                    mask = pending_self_action["mask"]
-                    if mask[CALL_HORA]:
-                        c_samples.append(
-                            _make_call_sample(
-                                state, actor, mask, CALL_HORA,
-                                called_tile_idx=None,
-                                hist_len=hist_len,
-                            )
-                        )
-                    pending_self_action = None
-                    discard_pending = None
-
-                state.apply_event(event)
-                continue
-
-            # ---------------------------------------------------
-            # end_kyoku
-            # ---------------------------------------------------
-            if etype == "end_kyoku":
-                _flush_pending_self_action_as_pass()
-                _flush_pending_discard_reactions()
-
-                discard_pending = None
-                state.apply_event(event)
-                continue
-
-            # ---------------------------------------------------
-            # other events
-            # ---------------------------------------------------
             state.apply_event(event)
 
-    if not _c_full():
-        if pending_self_action is not None:
-            actor = pending_self_action["actor"]
-            mask = pending_self_action["mask"]
-            if mask[CALL_PASS]:
-                c_samples.append(
-                    _make_call_sample(
-                        state, actor, mask, CALL_PASS,
-                        called_tile_idx=None,
-                        hist_len=hist_len,
-                    )
-                )
+            if etype == "dahai" and can_collect_dahai():
+                discarder = event.get("actor")
+                by_actor = {}
+                for player in range(4):
+                    if player == discarder:
+                        continue
+                    mask = state.legal_dahai_reaction_mask(player)
+                    if mask.sum().item() > 1:
+                        by_actor[player] = {
+                            "mask": mask,
+                            "resolved": False,
+                            "snapshot_state": copy.deepcopy(state),
+                        }
+                pending_dahai = {"by_actor": by_actor} if by_actor else None
+                continue
 
-        if call_pending_dahai is not None:
-            _add_discard_pass_samples(
-                state=state,
-                pending_dahai=call_pending_dahai,
-                samples=c_samples,
-                max_pass=max_pass_per_opp,
-                hist_len=hist_len,
-            )
+            if etype == "tsumo" and can_collect_tsumo():
+                actor = event.get("actor")
+                masks = state.legal_tsumo_action_masks(actor)
+                pending_tsumo = {
+                    "actor": actor,
+                    "masks": masks,
+                    "snapshot_state": copy.deepcopy(state),
+                    "saw_reach": False,
+                }
+                continue
 
-    return d_samples, c_samples
+            if etype in {"end_kyoku", "ryukyoku"}:
+                flush_pending_dahai_as_pass()
+                flush_pending_tsumo_skip()
 
+    flush_pending_dahai_as_pass()
+    flush_pending_tsumo_skip()
+    return dahai_samples, tsumo_samples
 
-def _add_discard_pass_samples(state, pending_dahai, samples, max_pass, hist_len=DEFAULT_HIST_LEN):
-    discarder = pending_dahai["actor"]
-    pai = pending_dahai["pai"]
-    pai_idx = pending_dahai["pai_idx"]
-    resolved = pending_dahai.get("resolved", set())
-
-    added = 0
-    for player in range(4):
-        if player == discarder:
-            continue
-        if player in resolved:
-            continue
-        if added >= max_pass:
-            break
-
-        mask = _build_discard_reaction_mask(state, player, discarder, pai, pai_idx)
-        if mask[CALL_PASS]:
-            samples.append(
-                _make_call_sample(
-                    state, player, mask, CALL_PASS,
-                    called_tile_idx=pai_idx,
-                    hist_len=hist_len,
-                )
-            )
-            added += 1
-
-
-# ============================================================
-# File discovery
-# ============================================================
 
 def find_gz_files(root_dir: Path, years, max_files):
     files = []
@@ -600,178 +321,224 @@ def find_gz_files(root_dir: Path, years, max_files):
     return files[:max_files]
 
 
-# ============================================================
-# Packing helpers
-# ============================================================
-
-def pack_discard_samples(samples):
+def pack_dahai_samples(samples):
     if not samples:
         return {
-            "x": torch.empty((0, 0, 34), dtype=torch.float32),
-            "mask": torch.empty((0, 34), dtype=torch.bool),
+            "x": torch.empty((0, 31, NUM_TILES), dtype=torch.float32),
+            "mask": torch.empty((0, NUM_CALL_KINDS), dtype=torch.bool),
             "hist": torch.empty((0, DEFAULT_HIST_LEN, 8), dtype=torch.long),
             "hist_mask": torch.empty((0, DEFAULT_HIST_LEN), dtype=torch.bool),
             "y": torch.empty((0,), dtype=torch.long),
         }
 
-    x = torch.stack([s[0] for s in samples]).float()
-    mask = torch.stack([s[1] for s in samples]).bool()
-    hist = torch.stack([s[2] for s in samples]).long()
-    hist_mask = torch.stack([s[3] for s in samples]).bool()
-    y = torch.tensor([s[4] for s in samples], dtype=torch.long)
-    return {"x": x, "mask": mask, "hist": hist, "hist_mask": hist_mask, "y": y}
+    return {
+        "x": torch.stack([s[0] for s in samples]).float(),
+        "mask": torch.stack([s[1] for s in samples]).bool(),
+        "hist": torch.stack([s[2] for s in samples]).long(),
+        "hist_mask": torch.stack([s[3] for s in samples]).bool(),
+        "y": torch.tensor([s[4] for s in samples], dtype=torch.long),
+    }
 
 
-def pack_call_samples(samples):
+def pack_tsumo_samples(samples):
     if not samples:
         return {
-            "x": torch.empty((0, 0, 34), dtype=torch.float32),
-            "mask": torch.empty((0, NUM_CALL_ACTIONS), dtype=torch.bool),
+            "x": torch.empty((0, 31, NUM_TILES), dtype=torch.float32),
+            "action_mask": torch.empty((0, NUM_TSUMO_ACTIONS), dtype=torch.bool),
+            "tile_mask": torch.empty((0, NUM_TILES), dtype=torch.bool),
             "hist": torch.empty((0, DEFAULT_HIST_LEN, 8), dtype=torch.long),
             "hist_mask": torch.empty((0, DEFAULT_HIST_LEN), dtype=torch.bool),
-            "y": torch.empty((0,), dtype=torch.long),
+            "action_y": torch.empty((0,), dtype=torch.long),
+            "tile_y": torch.empty((0,), dtype=torch.long),
         }
 
-    x = torch.stack([s[0] for s in samples]).float()
-    mask = torch.stack([s[1] for s in samples]).bool()
-    hist = torch.stack([s[2] for s in samples]).long()
-    hist_mask = torch.stack([s[3] for s in samples]).bool()
-    y = torch.tensor([s[4] for s in samples], dtype=torch.long)
-    return {"x": x, "mask": mask, "hist": hist, "hist_mask": hist_mask, "y": y}
+    return {
+        "x": torch.stack([s[0] for s in samples]).float(),
+        "action_mask": torch.stack([s[1] for s in samples]).bool(),
+        "tile_mask": torch.stack([s[2] for s in samples]).bool(),
+        "hist": torch.stack([s[3] for s in samples]).long(),
+        "hist_mask": torch.stack([s[4] for s in samples]).bool(),
+        "action_y": torch.tensor([s[5] for s in samples], dtype=torch.long),
+        "tile_y": torch.tensor([s[6] for s in samples], dtype=torch.long),
+    }
 
 
-# ============================================================
-# Shard save/load/merge
-# ============================================================
-
-def _save_shard(shard_path, d_samples, c_samples, source_path=None):
+def _save_shard(shard_path, dahai_samples, tsumo_samples, source_path=None):
     shard = {
-        "discard": pack_discard_samples(d_samples),
-        "call": pack_call_samples(c_samples),
+        "dahai": pack_dahai_samples(dahai_samples),
+        "tsumo": pack_tsumo_samples(tsumo_samples),
         "counts": {
-            "discard": len(d_samples),
-            "call": len(c_samples),
+            "dahai": len(dahai_samples),
+            "tsumo": len(tsumo_samples),
         },
         "source_path": str(source_path) if source_path is not None else None,
     }
     torch.save(shard, shard_path)
 
 
-def _merge_packed_discard(parts, max_samples):
-    xs, masks, hists, hist_masks, ys = [], [], [], [], []
+def _take_from_part(part, key, take):
+    return part[key][:take] if take > 0 else part[key][:0]
+
+
+def _get_packed_count(part, label_key):
+    return int(part[label_key].shape[0])
+
+
+def _prepare_memmap_tensor(base_dir: Path, name: str, shape, dtype: torch.dtype):
+    base_dir.mkdir(parents=True, exist_ok=True)
+    path = base_dir / f"{name}.mmap"
+    np_dtype = {
+        torch.float32: np.float32,
+        torch.bool: np.bool_,
+        torch.long: np.int64,
+    }[dtype]
+    mm = np.memmap(path, mode="w+", dtype=np_dtype, shape=shape)
+    return path, mm
+
+
+def _copy_tensor_into_memmap(mm, start: int, src: torch.Tensor):
+    if src.numel() == 0:
+        return
+    arr = src.detach().cpu().numpy()
+    mm[start:start + arr.shape[0]] = arr
+
+
+def _close_memmap(mm):
+    base = getattr(mm, "base", None)
+    mmap_obj = getattr(base, "close", None)
+    if callable(mmap_obj):
+        base.close()
+    elif hasattr(mm, "_mmap") and mm._mmap is not None:
+        mm._mmap.close()
+
+
+def _finalize_memmap_tensor(mm_path: Path, shape, dtype: torch.dtype):
+    np_dtype = {
+        torch.float32: np.float32,
+        torch.bool: np.bool_,
+        torch.long: np.int64,
+    }[dtype]
+    mm = np.memmap(mm_path, mode="r", dtype=np_dtype, shape=shape)
+    # np.array(..., copy=True) avoids the non-writable NumPy warning from torch.from_numpy
+    arr = np.array(mm, copy=True)
+    _close_memmap(mm)
+    del mm
+    tensor = torch.from_numpy(arr)
+    try:
+        mm_path.unlink()
+    except FileNotFoundError:
+        pass
+    return tensor
+
+
+def _merge_dataset_incremental(shard_paths, spec, max_samples, temp_dir: Path):
+    if max_samples == 0:
+        return spec["empty_fn"]()
+
     total = 0
-
-    for part in parts:
-        if total >= max_samples:
-            break
-        x = part["x"]
-        mask = part["mask"]
-        hist = part["hist"]
-        hist_mask = part["hist_mask"]
-        y = part["y"]
-
-        take = min(x.shape[0], max_samples - total)
-        if take <= 0:
+    for shard_path in shard_paths:
+        shard = torch.load(shard_path, weights_only=False)
+        part = shard[spec["shard_key"]]
+        part_n = _get_packed_count(part, spec["label_key"])
+        if max_samples > 0:
+            take = min(part_n, max_samples - total)
+        else:
+            take = part_n
+        total += max(take, 0)
+        if max_samples > 0 and total >= max_samples:
             break
 
-        xs.append(x[:take])
-        masks.append(mask[:take])
-        hists.append(hist[:take])
-        hist_masks.append(hist_mask[:take])
-        ys.append(y[:take])
-        total += take
+    if total == 0:
+        return spec["empty_fn"]()
 
-    if xs:
-        return {
-            "x": torch.cat(xs, dim=0),
-            "mask": torch.cat(masks, dim=0),
-            "hist": torch.cat(hists, dim=0),
-            "hist_mask": torch.cat(hist_masks, dim=0),
-            "y": torch.cat(ys, dim=0),
+    mm_specs = {}
+    for key, shape_fn, dtype in spec["fields"]:
+        shape = shape_fn(total)
+        mm_path, mm = _prepare_memmap_tensor(temp_dir / spec["shard_key"], key, shape, dtype)
+        mm_specs[key] = {
+            "path": mm_path,
+            "mm": mm,
+            "shape": shape,
+            "dtype": dtype,
         }
 
-    return {
-        "x": torch.empty((0, 0, 34), dtype=torch.float32),
-        "mask": torch.empty((0, 34), dtype=torch.bool),
-        "hist": torch.empty((0, DEFAULT_HIST_LEN, 8), dtype=torch.long),
-        "hist_mask": torch.empty((0, DEFAULT_HIST_LEN), dtype=torch.bool),
-        "y": torch.empty((0,), dtype=torch.long),
-    }
-
-
-def _merge_packed_call(parts, max_samples):
-    xs, masks, hists, hist_masks, ys = [], [], [], [], []
-    total = 0
-
-    for part in parts:
-        if total >= max_samples:
+    written = 0
+    for shard_path in shard_paths:
+        if written >= total:
             break
-        x = part["x"]
-        mask = part["mask"]
-        hist = part["hist"]
-        hist_mask = part["hist_mask"]
-        y = part["y"]
-
-        take = min(x.shape[0], max_samples - total)
+        shard = torch.load(shard_path, weights_only=False)
+        part = shard[spec["shard_key"]]
+        part_n = _get_packed_count(part, spec["label_key"])
+        take = min(part_n, total - written)
         if take <= 0:
-            break
+            continue
+        for key, _, _ in spec["fields"]:
+            _copy_tensor_into_memmap(mm_specs[key]["mm"], written, _take_from_part(part, key, take))
+        written += take
 
-        xs.append(x[:take])
-        masks.append(mask[:take])
-        hists.append(hist[:take])
-        hist_masks.append(hist_mask[:take])
-        ys.append(y[:take])
-        total += take
+    merged = {}
+    for key, _, _ in spec["fields"]:
+        info = mm_specs[key]
+        info["mm"].flush()
+        _close_memmap(info["mm"])
+        del info["mm"]
+        merged[key] = _finalize_memmap_tensor(info["path"], info["shape"], info["dtype"])
 
-    if xs:
-        return {
-            "x": torch.cat(xs, dim=0),
-            "mask": torch.cat(masks, dim=0),
-            "hist": torch.cat(hists, dim=0),
-            "hist_mask": torch.cat(hist_masks, dim=0),
-            "y": torch.cat(ys, dim=0),
-        }
-
-    return {
-        "x": torch.empty((0, 0, 34), dtype=torch.float32),
-        "mask": torch.empty((0, NUM_CALL_ACTIONS), dtype=torch.bool),
-        "hist": torch.empty((0, DEFAULT_HIST_LEN, 8), dtype=torch.long),
-        "hist_mask": torch.empty((0, DEFAULT_HIST_LEN), dtype=torch.bool),
-        "y": torch.empty((0,), dtype=torch.long),
-    }
+    return merged
 
 
 def merge_dataset_shards(
     shard_paths,
     out_dir,
-    max_discard_samples,
-    max_call_samples,
+    max_dahai_samples,
+    max_tsumo_samples,
     meta=None,
     cleanup_shards=False,
 ):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    discard_parts = []
-    call_parts = []
+    temp_dir = out_dir / "_merge_tmp"
 
-    for shard_path in shard_paths:
-        shard = torch.load(shard_path, weights_only=False)
-        discard_parts.append(shard["discard"])
-        call_parts.append(shard["call"])
+    dahai_spec = {
+        "shard_key": "dahai",
+        "label_key": "y",
+        "empty_fn": pack_dahai_samples,
+        "fields": [
+            ("x", lambda n: (n, 31, NUM_TILES), torch.float32),
+            ("mask", lambda n: (n, NUM_CALL_KINDS), torch.bool),
+            ("hist", lambda n: (n, DEFAULT_HIST_LEN, 8), torch.long),
+            ("hist_mask", lambda n: (n, DEFAULT_HIST_LEN), torch.bool),
+            ("y", lambda n: (n,), torch.long),
+        ],
+    }
+    tsumo_spec = {
+        "shard_key": "tsumo",
+        "label_key": "action_y",
+        "empty_fn": pack_tsumo_samples,
+        "fields": [
+            ("x", lambda n: (n, 31, NUM_TILES), torch.float32),
+            ("action_mask", lambda n: (n, NUM_TSUMO_ACTIONS), torch.bool),
+            ("tile_mask", lambda n: (n, NUM_TILES), torch.bool),
+            ("hist", lambda n: (n, DEFAULT_HIST_LEN, 8), torch.long),
+            ("hist_mask", lambda n: (n, DEFAULT_HIST_LEN), torch.bool),
+            ("action_y", lambda n: (n,), torch.long),
+            ("tile_y", lambda n: (n,), torch.long),
+        ],
+    }
 
-    discard_data = _merge_packed_discard(discard_parts, max_discard_samples)
-    call_data = _merge_packed_call(call_parts, max_call_samples)
+    dahai_data = _merge_dataset_incremental(shard_paths, dahai_spec, max_dahai_samples, temp_dir)
+    tsumo_data = _merge_dataset_incremental(shard_paths, tsumo_spec, max_tsumo_samples, temp_dir)
 
-    torch.save(discard_data, out_dir / "discard.pt")
-    torch.save(call_data, out_dir / "call.pt")
+    torch.save(dahai_data, out_dir / "dahai.pt")
+    torch.save(tsumo_data, out_dir / "tsumo.pt")
 
     if meta is not None:
         torch.save(meta, out_dir / "meta.pt")
 
     print(
-        f"Merged shards -> discard={discard_data['y'].shape[0]}, "
-        f"call={call_data['y'].shape[0]}"
+        f"Merged shards -> dahai={dahai_data['y'].shape[0]}, "
+        f"tsumo={tsumo_data['action_y'].shape[0]}"
     )
 
     if cleanup_shards:
@@ -781,53 +548,63 @@ def merge_dataset_shards(
             except FileNotFoundError:
                 pass
 
-    return discard_data, call_data
+    if temp_dir.exists():
+        for p in temp_dir.rglob("*"):
+            if p.is_file():
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+        for p in sorted(temp_dir.rglob("*"), reverse=True):
+            if p.is_dir():
+                try:
+                    p.rmdir()
+                except OSError:
+                    pass
+        try:
+            temp_dir.rmdir()
+        except OSError:
+            pass
 
+    return dahai_data, tsumo_data
 
-# ============================================================
-# Multiprocessing worker: scan one file and save one shard
-# ============================================================
 
 def _worker_to_shard(task):
-    idx, path, per_file_d, per_file_c, shard_dir, hist_len = task
+    idx, path, per_file_dahai, per_file_tsumo, shard_dir, hist_len = task
     shard_dir = Path(shard_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
     shard_path = shard_dir / f"shard_{idx:06d}.pt"
 
     try:
-        d_samples, c_samples = extract_all_from_file(
+        dahai_samples, tsumo_samples = extract_all_from_file(
             path,
-            max_d=per_file_d,
-            max_c=per_file_c,
+            max_dahai_samples=per_file_dahai,
+            max_tsumo_samples=per_file_tsumo,
             hist_len=hist_len,
         )
-        _save_shard(shard_path, d_samples, c_samples, source_path=path)
+        _save_shard(shard_path, dahai_samples, tsumo_samples, source_path=path)
         return {
             "ok": True,
             "shard_path": str(shard_path),
-            "discard": len(d_samples),
-            "call": len(c_samples),
+            "dahai": len(dahai_samples),
+            "tsumo": len(tsumo_samples),
         }
     except Exception as e:
         print(f"Error processing {path}: {e}")
         return {
             "ok": False,
             "shard_path": None,
-            "discard": 0,
-            "call": 0,
+            "dahai": 0,
+            "tsumo": 0,
         }
 
-
-# ============================================================
-# Main dataset builder: workers write shards, parent merges
-# ============================================================
 
 def build_dataset_shards(
     root_dir,
     years,
     max_files,
-    max_discard_samples,
-    max_call_samples,
+    max_dahai_samples,
+    max_tsumo_samples,
     num_workers=4,
     shard_dir="./processed_dataset/shards",
     hist_len=DEFAULT_HIST_LEN,
@@ -835,37 +612,34 @@ def build_dataset_shards(
     files = find_gz_files(Path(root_dir), years, max_files)
     print(f"Found {len(files)} files, scanning with {num_workers} workers...")
 
-    base_per_d = (
-        max(max_discard_samples // max(len(files), 1) * 3, 500)
-        if max_discard_samples > 0 else 0
-    )
-    base_per_c = (
-        max(max_call_samples // max(len(files), 1) * 3, 500)
-        if max_call_samples > 0 else 0
-    )
+    base_per_dahai = max(max_dahai_samples // max(len(files), 1) * 3, 500) if max_dahai_samples > 0 else 0
+    base_per_tsumo = max(max_tsumo_samples // max(len(files), 1) * 3, 500) if max_tsumo_samples > 0 else 0
 
     shard_dir = Path(shard_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
 
     shard_paths = []
-    total_d = 0
-    total_c = 0
+    total_dahai = 0
+    total_tsumo = 0
 
-    def discard_done():
-        return (max_discard_samples > 0) and (total_d >= max_discard_samples)
+    def dahai_done():
+        return max_dahai_samples > 0 and total_dahai >= max_dahai_samples
 
-    def call_done():
-        return (max_call_samples > 0) and (total_c >= max_call_samples)
+    def tsumo_done():
+        return max_tsumo_samples > 0 and total_tsumo >= max_tsumo_samples
 
     def both_done():
-        d_ok = (max_discard_samples <= 0) or (total_d >= max_discard_samples)
-        c_ok = (max_call_samples <= 0) or (total_c >= max_call_samples)
-        return d_ok and c_ok
+        d_ok = max_dahai_samples <= 0 or total_dahai >= max_dahai_samples
+        t_ok = max_tsumo_samples <= 0 or total_tsumo >= max_tsumo_samples
+        return d_ok and t_ok
 
     def make_task(file_idx):
-        per_d = 0 if discard_done() else base_per_d
-        per_c = 0 if call_done() else base_per_c
-        return (file_idx, files[file_idx], per_d, per_c, str(shard_dir), hist_len)
+        remaining_dahai = max(0, max_dahai_samples - total_dahai) if max_dahai_samples > 0 else 0
+        remaining_tsumo = max(0, max_tsumo_samples - total_tsumo) if max_tsumo_samples > 0 else 0
+
+        per_dahai = 0 if dahai_done() else min(base_per_dahai, remaining_dahai)
+        per_tsumo = 0 if tsumo_done() else min(base_per_tsumo, remaining_tsumo)
+        return (file_idx, files[file_idx], per_dahai, per_tsumo, str(shard_dir), hist_len)
 
     if num_workers <= 1:
         scanned = 0
@@ -873,21 +647,17 @@ def build_dataset_shards(
             if both_done():
                 print("Reached requested sample targets. Stopping early.")
                 break
-
-            task = make_task(file_idx)
-            result = _worker_to_shard(task)
+            result = _worker_to_shard(make_task(file_idx))
             scanned += 1
 
             if not result["ok"]:
                 continue
-
             shard_paths.append(result["shard_path"])
-            total_d += result["discard"]
-            total_c += result["call"]
+            total_dahai += result["dahai"]
+            total_tsumo += result["tsumo"]
 
             if scanned % 100 == 0:
-                print(f"Scanned {scanned}/{len(files)} -> d={total_d}, c={total_c}")
-
+                print(f"Scanned {scanned}/{len(files)} -> dahai={total_dahai}, tsumo={total_tsumo}")
     else:
         pool = Pool(num_workers)
         pending = []
@@ -895,30 +665,26 @@ def build_dataset_shards(
         scanned = 0
 
         try:
-            # Initial fill
             while next_file_idx < len(files) and len(pending) < num_workers and not both_done():
-                task = make_task(next_file_idx)
-                pending.append(pool.apply_async(_worker_to_shard, (task,)))
+                pending.append(pool.apply_async(_worker_to_shard, (make_task(next_file_idx),)))
                 next_file_idx += 1
 
             while pending:
                 new_pending = []
-
                 for job in pending:
                     result = job.get()
                     scanned += 1
 
                     if result["ok"]:
                         shard_paths.append(result["shard_path"])
-                        total_d += result["discard"]
-                        total_c += result["call"]
+                        total_dahai += result["dahai"]
+                        total_tsumo += result["tsumo"]
 
                     if scanned % 100 == 0:
-                        print(f"Scanned {scanned}/{len(files)} -> d={total_d}, c={total_c}")
+                        print(f"Scanned {scanned}/{len(files)} -> dahai={total_dahai}, tsumo={total_tsumo}")
 
                     if not both_done() and next_file_idx < len(files):
-                        task = make_task(next_file_idx)
-                        new_pending.append(pool.apply_async(_worker_to_shard, (task,)))
+                        new_pending.append(pool.apply_async(_worker_to_shard, (make_task(next_file_idx),)))
                         next_file_idx += 1
 
                 pending = new_pending
@@ -926,12 +692,11 @@ def build_dataset_shards(
                 if both_done():
                     print("Reached requested sample targets. Stopping worker pool early.")
                     break
-
         finally:
             pool.terminate()
             pool.join()
 
-    print(f"Shard build complete: discard={total_d}, call={total_c}")
+    print(f"Shard build complete: dahai={total_dahai}, tsumo={total_tsumo}")
     return shard_paths
 
 
@@ -939,8 +704,8 @@ def build_and_save_dataset(
     root_dir,
     years,
     max_files,
-    max_discard_samples,
-    max_call_samples,
+    max_dahai_samples,
+    max_tsumo_samples,
     num_workers=4,
     out_dir="./processed_dataset",
     shard_subdir="shards",
@@ -955,76 +720,35 @@ def build_and_save_dataset(
         root_dir=root_dir,
         years=years,
         max_files=max_files,
-        max_discard_samples=max_discard_samples,
-        max_call_samples=max_call_samples,
+        max_dahai_samples=max_dahai_samples,
+        max_tsumo_samples=max_tsumo_samples,
         num_workers=num_workers,
         shard_dir=shard_dir,
         hist_len=hist_len,
     )
+    # shard_paths = [f"C:/Users/houbo/Desktop/cs566-project/processed_dataset/shards/shard_{i:06}.pt" for i in range(7131)]
 
-    discard, call = merge_dataset_shards(
+    dahai, tsumo = merge_dataset_shards(
         shard_paths=shard_paths,
         out_dir=out_dir,
-        max_discard_samples=max_discard_samples,
-        max_call_samples=max_call_samples,
+        max_dahai_samples=max_dahai_samples,
+        max_tsumo_samples=max_tsumo_samples,
         meta=meta,
         cleanup_shards=cleanup_shards,
     )
 
-    return discard, call, shard_paths
+    return dahai, tsumo, shard_paths
 
 
-def build_dataset(root_dir, years, max_files,
-                  max_discard_samples, max_call_samples,
-                  num_workers=4, hist_len=DEFAULT_HIST_LEN):
-    tmp_out = Path("./_tmp_processed_dataset_compat")
-    discard, call, _ = build_and_save_dataset(
-        root_dir=root_dir,
-        years=years,
-        max_files=max_files,
-        max_discard_samples=max_discard_samples,
-        max_call_samples=max_call_samples,
-        num_workers=num_workers,
-        out_dir=tmp_out,
-        cleanup_shards=True,
-        hist_len=hist_len,
-    )
-
-    d_samples = list(zip(
-        discard["x"],
-        discard["mask"],
-        discard["hist"],
-        discard["hist_mask"],
-        discard["y"].tolist(),
-    ))
-    c_samples = list(zip(
-        call["x"],
-        call["mask"],
-        call["hist"],
-        call["hist_mask"],
-        call["y"].tolist(),
-    ))
-    return d_samples, c_samples
-
-
-# ============================================================
-# Save/load processed dataset
-# ============================================================
-
-def save_processed_dataset(
-    out_dir,
-    discard_samples,
-    call_samples,
-    meta=None,
-):
+def save_processed_dataset(out_dir, dahai_samples, tsumo_samples, meta=None):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    discard_data = pack_discard_samples(discard_samples)
-    call_data = pack_call_samples(call_samples)
+    dahai_data = pack_dahai_samples(dahai_samples)
+    tsumo_data = pack_tsumo_samples(tsumo_samples)
 
-    torch.save(discard_data, out_dir / "discard.pt")
-    torch.save(call_data, out_dir / "call.pt")
+    torch.save(dahai_data, out_dir / "dahai.pt")
+    torch.save(tsumo_data, out_dir / "tsumo.pt")
 
     if meta is not None:
         torch.save(meta, out_dir / "meta.pt")
@@ -1032,32 +756,23 @@ def save_processed_dataset(
     print(f"Saved processed dataset to {out_dir}")
 
 
-def load_processed_discard_dataset(data_dir):
+def load_processed_dahai_dataset(data_dir):
     data_dir = Path(data_dir)
-
-    discard = torch.load(data_dir / "discard.pt", weights_only=False)
-
+    data = torch.load(data_dir / "dahai.pt", weights_only=False)
     meta_path = data_dir / "meta.pt"
     meta = torch.load(meta_path, weights_only=False) if meta_path.exists() else None
+    return data, meta
 
-    return discard, meta
 
-def load_processed_call_dataset(data_dir):
+def load_processed_tsumo_dataset(data_dir):
     data_dir = Path(data_dir)
-
-    call = torch.load(data_dir / "call.pt", weights_only=False)
-
+    data = torch.load(data_dir / "tsumo.pt", weights_only=False)
     meta_path = data_dir / "meta.pt"
     meta = torch.load(meta_path, weights_only=False) if meta_path.exists() else None
+    return data, meta
 
-    return call, meta
 
-
-# ============================================================
-# PyTorch datasets
-# ============================================================
-
-class MahjongDiscardDataset(Dataset):
+class MahjongDahaiDataset(Dataset):
     def __init__(self, packed):
         self.x = packed["x"]
         self.mask = packed["mask"]
@@ -1072,16 +787,26 @@ class MahjongDiscardDataset(Dataset):
         return self.x[idx], self.mask[idx], self.hist[idx], self.hist_mask[idx], self.y[idx]
 
 
-class MahjongCallDataset(Dataset):
+class MahjongTsumoDataset(Dataset):
     def __init__(self, packed):
         self.x = packed["x"]
-        self.mask = packed["mask"]
+        self.action_mask = packed["action_mask"]
+        self.tile_mask = packed["tile_mask"]
         self.hist = packed["hist"]
         self.hist_mask = packed["hist_mask"]
-        self.y = packed["y"]
+        self.action_y = packed["action_y"]
+        self.tile_y = packed["tile_y"]
 
     def __len__(self):
-        return self.y.shape[0]
+        return self.action_y.shape[0]
 
     def __getitem__(self, idx):
-        return self.x[idx], self.mask[idx], self.hist[idx], self.hist_mask[idx], self.y[idx]
+        return (
+            self.x[idx],
+            self.action_mask[idx],
+            self.tile_mask[idx],
+            self.hist[idx],
+            self.hist_mask[idx],
+            self.action_y[idx],
+            self.tile_y[idx],
+        )
