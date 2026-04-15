@@ -10,13 +10,12 @@ from dataloader import (
     TSUMO_ACTION_NAMES,
 )
 
-YEARS = [2025, 2026]
 MAX_FILES = 10_000
 MAX_DAHAI_SAMPLES = 1_000_000
 MAX_TSUMO_SAMPLES = 2_000_000
 NUM_DATA_LOADER_WORKERS = 16
 
-DATASET_HANDLE = "shokanekolouis/tenhou-to-mjai"
+DATASET_HANDLE = "ziyanzzy123123/mahjong-soul-dataset-phoenix-room"
 DATASET_PATH = Path(kagglehub.dataset_download(DATASET_HANDLE))
 
 OUT_DIR = Path("./processed_dataset")
@@ -26,7 +25,6 @@ CLEANUP_SHARDS_AFTER_MERGE = True
 if __name__ == "__main__":
     meta = {
         "root_dir": str(DATASET_PATH),
-        "years": YEARS,
         "max_files": MAX_FILES,
         "max_dahai_samples": MAX_DAHAI_SAMPLES,
         "max_tsumo_samples": MAX_TSUMO_SAMPLES,
@@ -36,7 +34,6 @@ if __name__ == "__main__":
 
     dahai_data, tsumo_data, shard_paths = build_and_save_dataset(
         root_dir=DATASET_PATH,
-        years=YEARS,
         max_files=MAX_FILES,
         max_dahai_samples=MAX_DAHAI_SAMPLES,
         max_tsumo_samples=MAX_TSUMO_SAMPLES,

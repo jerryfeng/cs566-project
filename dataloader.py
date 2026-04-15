@@ -308,15 +308,8 @@ def extract_all_from_file(
     return dahai_samples, tsumo_samples
 
 
-def find_gz_files(root_dir: Path, years, max_files):
-    files = []
-    for year in years:
-        year_dir = root_dir / str(year)
-        if not year_dir.exists():
-            continue
-        year_files = list(year_dir.rglob("*.mjson"))
-        random.shuffle(year_files)
-        files.extend(year_files)
+def find_gz_files(root_dir: Path, max_files):
+    files = list(root_dir.rglob("*.mjson"))
     random.shuffle(files)
     return files[:max_files]
 
@@ -601,7 +594,6 @@ def _worker_to_shard(task):
 
 def build_dataset_shards(
     root_dir,
-    years,
     max_files,
     max_dahai_samples,
     max_tsumo_samples,
@@ -609,7 +601,7 @@ def build_dataset_shards(
     shard_dir="./processed_dataset/shards",
     hist_len=DEFAULT_HIST_LEN,
 ):
-    files = find_gz_files(Path(root_dir), years, max_files)
+    files = find_gz_files(Path(root_dir), max_files)
     print(f"Found {len(files)} files, scanning with {num_workers} workers...")
 
     base_per_dahai = max(max_dahai_samples // max(len(files), 1) * 3, 500) if max_dahai_samples > 0 else 0
@@ -702,7 +694,6 @@ def build_dataset_shards(
 
 def build_and_save_dataset(
     root_dir,
-    years,
     max_files,
     max_dahai_samples,
     max_tsumo_samples,
@@ -718,7 +709,6 @@ def build_and_save_dataset(
 
     shard_paths = build_dataset_shards(
         root_dir=root_dir,
-        years=years,
         max_files=max_files,
         max_dahai_samples=max_dahai_samples,
         max_tsumo_samples=max_tsumo_samples,
