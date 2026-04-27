@@ -17,6 +17,7 @@ The project focuses on training practical Mahjong agents using supervised learni
 - MJAI-compatible bot integration for simulation and testing
 
 ## Model Design
+<img width="1665" height="945" alt="model" src="https://github.com/user-attachments/assets/fb92eb3b-4fe6-461b-88a3-a0f70360d20a" />
 
 ### Board State Encoder
 
